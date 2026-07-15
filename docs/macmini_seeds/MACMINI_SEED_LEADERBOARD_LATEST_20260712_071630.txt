@@ -1,0 +1,10 @@
+  #       seed  route     score  acc/min   dup%  verif  res0  noisy  pass%   bal  @cap  1stEv(h)  flags
+  1   94104773     gs     118.5    523.4   0.0%      0     0      0  0.26%  0.86     0         -  -
+  2   94107918     gs     118.5    521.3   0.0%      0     0      0  0.26%  0.86     0         -  -
+  3   94124629     gs     118.4    526.1   0.0%      0     0      0  0.26%  0.85     0         -  -
+  4   94153166     gs     118.4    523.6   0.0%      0     0      0  0.26%  0.86     0         -  -
+  5   94131748     gs     118.3    526.6   0.0%      0     0      0  0.26%  0.85     0         -  -
+  6   94156876     gs     118.2    525.6   0.0%      0     0      0  0.26%  0.86     0         -  -
+
+written: work_scout/seed_leaderboard.json (6 seeds, 6 workers incl. retired)
+note: raw noisy collisions are capped at +5.0 pts total; only residual_zero/verified evidence can dominate the ranking.

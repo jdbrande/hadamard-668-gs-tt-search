@@ -1,0 +1,61 @@
+
+# H668 repository exclusions
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# macOS
+.DS_Store
+.AppleDouble
+._*
+
+# Runtime state
+work/
+logs/
+snapshots/
+checkpoints/
+*.pid
+STOP
+PAUSE
+
+# Databases
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Generated search data
+*.npz
+*.npy
+*.bin
+*.dylib
+*.so
+*.o
+*.tmp
+
+# Generated solutions
+SOLUTION.json
+SOLUTION.csv
+solution.json
+solution.csv
+collisions_*.txt
+
+# Local environment
+.env
+.env.*
+credentials.json
+secrets.json
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+
+# Search backups and large runtime artifacts
+backups/
+*.tgz
+*.npz

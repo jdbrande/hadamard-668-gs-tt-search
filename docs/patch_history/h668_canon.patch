@@ -1,0 +1,623 @@
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before9/bench_canon.py h668_hardened/bench_canon.py
+--- h668_before9/bench_canon.py	1970-01-01 00:00:00.000000000 +0000
++++ h668_hardened/bench_canon.py	2026-07-12 01:54:56.175499180 +0000
+@@ -0,0 +1,68 @@
++#!/usr/bin/env python3
++"""Canonical-dedup benchmark: merge cost/size and same-bin pair reduction."""
++import os
++import shutil
++import subprocess
++import sys
++import time
++from collections import defaultdict
++
++import numpy as np
++
++
++def main():
++    import core
++    import engine
++    import worker as wk
++    rng = np.random.default_rng(9)
++    WD = "bench_canon_work"
++    shutil.rmtree(WD, ignore_errors=True)
++
++    # --- merge: 2 workers x 3 gs bins x 8k rows, 50% planted orbit dups ---
++    # (random +-1 rows: canonical-dedup cost is independent of the sieve)
++    route = wk.GSRoute(167)
++    bins3 = sorted(route.bins)[:3]
++    base = {}
++    for b in bins3:
++        base[wk.bin_key(b)] = rng.choice(
++            np.array([-1, 1], np.int8), (8000, 167))
++    for widx in (0, 1):
++        d = os.path.join(WD, f"worker_{widx:03d}")
++        os.makedirs(d, exist_ok=True)
++        pools = {}
++        for k, arr in base.items():
++            half = arr[widx * 4000:(widx + 1) * 4000]
++            dup = -np.roll(arr[:2000] if widx else arr[6000:],
++                           widx + 1, axis=1)[:, ::-1]
++            pools[k] = np.concatenate([half, dup])
++        np.savez_compressed(os.path.join(d, "pools.npz"), **pools)
++    raw = sum(4000 + 2000 for _ in base) * 2
++    t0 = time.perf_counter()
++    r = subprocess.run([sys.executable, "ctl.py", "merge",
++                        "--workdir", WD], capture_output=True, text=True)
++    dt = time.perf_counter() - t0
++    gg = np.load(os.path.join(WD, "global_pools_gs.npz"))
++    kept = sum(len(gg[k]) for k in gg.files)
++    size = os.path.getsize(os.path.join(WD, "global_pools_gs.npz"))
++    print(f"merge (canonical): {raw:,} raw rows -> {kept:,} kept "
++          f"({raw - kept:,} orbit dups removed) in {dt:.2f}s "
++          f"({raw / dt:,.0f} rows/s)")
++    print(f"global_pools_gs.npz: {size / 1024:.0f} KB "
++          f"(raw would be ~{size * raw / max(kept, 1) / 1024:.0f} KB)")
++    shutil.rmtree(WD, ignore_errors=True)
++
++    # --- same-bin pair reduction ---
++    paf = rng.integers(-40, 40, (500, 83)).astype(np.int16)
++    for tri in (False, True):
++        s = defaultdict(int)
++        t0 = time.perf_counter()
++        engine.match(paf, paf, paf, paf, max_pairs=10**12, stats=s,
++                     offs=(0, 0, 0, 0), tri=(tri, tri))
++        dtm = time.perf_counter() - t0
++        print(f"same-bin key, tri={tri!s:5}: pairs hashed "
++              f"{s['pairs_hashed']:>9,}  probes {s['probes']:>9,}  "
++              f"swap skipped {s['swap_skipped']:>9,}  wall {dtm:.3f}s")
++
++
++if __name__ == "__main__":
++    main()
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before9/ctl.py h668_hardened/ctl.py
+--- h668_before9/ctl.py	2026-07-11 03:36:30.247826866 +0000
++++ h668_hardened/ctl.py	2026-07-11 03:38:04.828311072 +0000
+@@ -288,9 +288,38 @@
+     def route_of_key(k):
+         return "tt" if k.startswith(("bxy_", "bz_", "bw_")) else "gs"
+ 
++    def canon_dedup(arr, periodic):
++        """Keep one representative per canonical orbit. Uses the SAME
++        representative rule as the worker path (core.canonical_key over
++        negation x rotations x reversal for periodic; negation x reversal
++        for nonperiodic), so worker absorb sees identical keys."""
++        if len(arr) == 0:
++            return arr, 0
++        seen = set()
++        keep = []
++        for row in arr:
++            k = core.canonical_key(np.ascontiguousarray(row, np.int8),
++                                   periodic)
++            if k not in seen:
++                seen.add(k)
++                keep.append(row)
++        removed = len(arr) - len(keep)
++        return (np.array(keep, dtype=np.int8)
++                if keep else arr[:0]), removed
++
+     for route in ("gs", "tt"):
+         keys = {k: v for k, v in merged.items()
+                 if route_of_key(k) == route}
++        raw_rows = sum(len(v) for v in keys.values())
++        removed_total = 0
++        for k in list(keys):
++            deduped, removed = canon_dedup(keys[k], periodic=(route == "gs"))
++            keys[k] = deduped
++            removed_total += removed
++        kept_rows = sum(len(v) for v in keys.values())
++        print(f"[merge/{route}] raw rows read: {raw_rows:,}  "
++              f"canonical kept: {kept_rows:,}  "
++              f"orbit duplicates removed: {removed_total:,}")
+         out = os.path.join(a.workdir, f"global_pools_{route}.npz")
+         tmp = f"{out}.tmp.{os.getpid()}.npz"
+         np.savez_compressed(tmp, **keys)
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before9/engine.py h668_hardened/engine.py
+--- h668_before9/engine.py	2026-07-11 03:36:30.255634319 +0000
++++ h668_hardened/engine.py	2026-07-11 03:36:32.544398983 +0000
+@@ -128,7 +128,10 @@
+ 
+ 
+ def _numpy_match(pafA, pafB, pafC, pafD, wt1, wt2, stats,
+-                 psd1=None, psd2=None, collision_log=None, lo=0):
++                 psd1=None, psd2=None, collision_log=None, lo=0,
++                 offs=(0, 0, 0, 0), tri=(False, False)):
++    a_off, b_off, c_off, d_off = offs
++    a_off += lo
+     psdA, psdB, cap1 = psd1 if psd1 else (None, None, None)
+     psdC, psdD, cap2 = psd2 if psd2 else (None, None, None)
+     wA = top_freqs(psdA) if psdA is not None else None
+@@ -142,6 +145,9 @@
+     for i in range(len(pafA)):
+         rows = wt1 * (pafA[i][None, :].astype(np.int32) + pafB)
+         for j in range(len(pafB)):
++            if tri[0] and (a_off + i) > (b_off + j):
++                stats["swap_skipped"] += 1
++                continue
+             if ok1 is not None and not ok1[i, j]:
+                 stats["psd_skipped"] += 1
+                 continue
+@@ -152,6 +158,9 @@
+         rows = -wt2 * (pafC[k][None, :].astype(np.int32) + pafD)
+         keys = rows.astype(np.int16)
+         for l in range(len(pafD)):
++            if tri[1] and (c_off + k) > (d_off + l):
++                stats["swap_skipped"] += 1
++                continue
+             if ok2 is not None and not ok2[k, l]:
+                 stats["psd_skipped"] += 1
+                 continue
+@@ -168,7 +177,8 @@
+ 
+ def match(pafA, pafB, pafC, pafD, wt1=1, wt2=1,
+           max_pairs=20_000_000, chunk=4000, stats=None,
+-          psd1=None, psd2=None, on_progress=None, collision_log=None):
++          psd1=None, psd2=None, on_progress=None, collision_log=None,
++          offs=(0, 0, 0, 0), tri=(False, False)):
+     """Find (i,j,k,l) with wt1*(pafA[i]+pafB[j]) + wt2*(pafC[k]+pafD[l]) = 0.
+ 
+     COMPLETE over the given arrays: chunking never drops rows. Optional
+@@ -194,11 +204,13 @@
+         pA = (psdA_all[lo:lo + eff], psd1[1], psd1[2]) if psd1 else None
+         if lib is not None:
+             r = _cc_match(lib, A, pafB, pafC, pafD, h, wt1, wt2,
+-                          pA, psd2, stats, collision_log, lo)
++                          pA, psd2, stats, collision_log, lo,
++                          offs=offs, tri=tri)
+         else:
+             r = _numpy_match(A, pafB, pafC, pafD, wt1, wt2, stats,
+                              psd1=pA, psd2=psd2,
+-                             collision_log=collision_log, lo=lo)
++                             collision_log=collision_log, lo=lo,
++                             offs=offs, tri=tri)
+         if r is not None:
+             return (r[0] + lo, r[1], r[2], r[3])
+     if on_progress is not None:
+@@ -207,9 +219,11 @@
+ 
+ 
+ def _cc_match(lib, A, pafB, pafC, pafD, h, wt1, wt2, psd1, psd2, stats,
+-              collision_log=None, lo=0):
++              collision_log=None, lo=0, offs=(0, 0, 0, 0),
++              tri=(False, False)):
+     out = (ctypes.c_longlong * 4)()
+     st = (ctypes.c_longlong * 5)()
++    use_v6 = hasattr(lib, "match_pairs_v6")
+     use_v5 = hasattr(lib, "match_pairs_v5")
+     use_v4 = hasattr(lib, "match_pairs_v4")
+     coll_buf = (ctypes.c_longlong * (64 * 4))()
+@@ -244,7 +258,27 @@
+     # keep references alive through the call
+     holders = [np.ascontiguousarray(x, dtype=np.float32)
+                for x in (psdA, psdB, psdC, psdD) if x is not None]
+-    if use_v5:
++    if use_v6:
++        st6 = (ctypes.c_longlong * 7)()
++        found = lib.match_pairs_v6(
++            P16(A), len(A), P16(pafB), len(pafB),
++            P16(pafC), len(pafC), P16(pafD), len(pafD),
++            h, wt1, wt2,
++            PF(psdA), PI(wA), PF(psdB), PI(wB),
++            PF(psdC), PI(wC), PF(psdD), PI(wD),
++            F, K, cap1, cap2,
++            offs[0] + lo, offs[1], offs[2], offs[3],
++            1 if tri[0] else 0, 1 if tri[1] else 0,
++            out, st6, coll_buf, 64, ctypes.byref(coll_n))
++        for x in range(5):
++            st[x] = st6[x]
++        stats["swap_skipped"] += st6[5] + st6[6]
++        if collision_log is not None:
++            for x in range(coll_n.value):
++                collision_log.append(
++                    (coll_buf[4 * x] + lo, coll_buf[4 * x + 1],
++                     coll_buf[4 * x + 2], coll_buf[4 * x + 3]))
++    elif use_v5:
+         found = lib.match_pairs_v5(
+             P16(A), len(A), P16(pafB), len(pafB),
+             P16(pafC), len(pafC), P16(pafD), len(pafD),
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before9/fastmatch.cpp h668_hardened/fastmatch.cpp
+--- h668_before9/fastmatch.cpp	2026-07-11 03:36:30.255826866 +0000
++++ h668_hardened/fastmatch.cpp	2026-07-12 01:56:32.627968804 +0000
+@@ -208,27 +208,33 @@
+ // when not). out must hold n bytes. Returns 0.
+ extern "C" int canon_key(const int8_t *seq, int64_t n, int periodic,
+                          int8_t *out) {
+-    std::vector<int8_t> best(seq, seq + n);
+-    std::vector<int8_t> cand(n), var(n);
+-    bool have = false;
+-    for (int rev = 0; rev < 2; rev++) {
+-        for (int64_t i = 0; i < n; i++)
+-            var[i] = rev ? seq[n - 1 - i] : seq[i];
+-        for (int sign = 0; sign < 2; sign++) {
+-            const int8_t mul = sign ? -1 : 1;
+-            int64_t rots = periodic ? n : 1;
+-            for (int64_t r = 0; r < rots; r++) {
+-                for (int64_t i = 0; i < n; i++)
+-                    cand[i] = (int8_t)(mul * var[(r + i) % n]);
+-                if (!have ||
+-                    std::memcmp(cand.data(), best.data(), n) < 0) {
+-                    best = cand;
+-                    have = true;
+-                }
+-            }
+-        }
++    // Same candidate set as before (negation x reversal x rotations),
++    // same lexicographic minimum -- but each rotation is a pointer into a
++    // doubled buffer, so a candidate comparison is one memcmp instead of
++    // n modulo operations. Byte-identical output, ~70x faster at n=167.
++    std::vector<int8_t> bufs(4 * 2 * n);
++    int8_t *f = bufs.data(), *nf = f + 2 * n, *r = nf + 2 * n,
++           *nr = r + 2 * n;
++    for (int64_t i = 0; i < n; i++) {
++        f[i] = seq[i];
++        r[i] = seq[n - 1 - i];
++        nf[i] = (int8_t)(-seq[i]);
++        nr[i] = (int8_t)(-seq[n - 1 - i]);
+     }
+-    std::memcpy(out, best.data(), n);
++    std::memcpy(f + n, f, n);
++    std::memcpy(nf + n, nf, n);
++    std::memcpy(r + n, r, n);
++    std::memcpy(nr + n, nr, n);
++    const int8_t *bases[4] = {f, nf, r, nr};
++    const int8_t *best = f;
++    const int64_t rots = periodic ? n : 1;
++    for (int v = 0; v < 4; v++)
++        for (int64_t rot = 0; rot < rots; rot++) {
++            const int8_t *cand = bases[v] + rot;
++            if (std::memcmp(cand, best, n) < 0)
++                best = cand;
++        }
++    std::memcpy(out, best, n);
+     return 0;
+ }
+ 
+@@ -383,6 +389,92 @@
+             if (s2 && psd_reject(psdC, psdD, wC, wD, k2, l, F, K, cap2)) {
+                 stats[4]++; continue;
+             }
++            combine_rows(rc, pafD + l * h, (int16_t)(-wt2),
++                         probe.data(), h);
++            stats[2]++;
++            uint64_t k = hash64w(probe.data(), h), pos = k & (cap - 1);
++            while (keys[pos] != 0) {
++                if (keys[pos] == k) {
++                    stats[3]++;
++                    int64_t i = ai[pos], j = bj[pos];
++                    if (*coll_n < coll_cap) {
++                        int64_t *rec = coll_out + (*coll_n) * 4;
++                        rec[0] = i; rec[1] = j; rec[2] = k2; rec[3] = l;
++                        (*coll_n)++;
++                    }
++                    combine_rows(pafA + i * h, pafB + j * h, wt1,
++                                 chk.data(), h);
++                    if (std::memcmp(chk.data(), probe.data(), h * 2) == 0) {
++                        out_idx[0] = i; out_idx[1] = j;
++                        out_idx[2] = k2; out_idx[3] = l;
++                        return 1;
++                    }
++                }
++                pos = (pos + 1) & (cap - 1);
++            }
++        }
++    }
++    return 0;
++}
++
++// v6: v5 plus same-bin swap deduplication. When two sides of a pair draw
++// from the SAME bin, global-index pairs with i > j are skipped (tri flag,
++// offsets map chunk-local to global indices). Soundness: the matching
++// condition is symmetric in the two sequences of a side (sum of equally
++// weighted autocorrelations), so if (i,j,...) is a solution so is
++// (j,i,...); keeping i <= j retains a representative of every solution.
++// stats[6] = { pairs, buckets, probes, collchk, psd_skip, swap_skip_build,
++//              swap_skip_probe }  (first five identical to v5 semantics)
++extern "C" int64_t match_pairs_v6(
++    const int16_t *pafA, int64_t na, const int16_t *pafB, int64_t nb,
++    const int16_t *pafC, int64_t nc, const int16_t *pafD, int64_t nd,
++    int64_t h, int16_t wt1, int16_t wt2,
++    const float *psdA, const int32_t *wA, const float *psdB,
++    const int32_t *wB,
++    const float *psdC, const int32_t *wC, const float *psdD,
++    const int32_t *wD,
++    int64_t F, int64_t K, float cap1, float cap2,
++    int64_t a_off, int64_t b_off, int64_t c_off, int64_t d_off,
++    int32_t tri1, int32_t tri2,
++    int64_t *out_idx, int64_t *stats,
++    int64_t *coll_out, int64_t coll_cap, int64_t *coll_n) {
++
++    for (int i = 0; i < 7; i++) stats[i] = 0;
++    *coll_n = 0;
++    if (na * nb == 0 || nc * nd == 0) return 0;
++    const bool s1 = psdA && psdB && wA && cap1 > 0 && K > 0;
++    const bool s2 = psdC && psdD && wC && cap2 > 0 && K > 0;
++
++    uint64_t cap = 1;
++    while ((int64_t)cap < 2 * na * nb) cap <<= 1;
++    std::vector<uint64_t> keys(cap, 0);
++    std::vector<uint32_t> ai(cap), bj(cap);
++    std::vector<int16_t> buf(h);
++
++    for (int64_t i = 0; i < na; i++) {
++        const int16_t *ra = pafA + i * h;
++        for (int64_t j = 0; j < nb; j++) {
++            if (tri1 && (a_off + i) > (b_off + j)) { stats[5]++; continue; }
++            if (s1 && psd_reject(psdA, psdB, wA, wB, i, j, F, K, cap1)) {
++                stats[4]++; continue;
++            }
++            combine_rows(ra, pafB + j * h, wt1, buf.data(), h);
++            uint64_t k = hash64w(buf.data(), h), pos = k & (cap - 1);
++            while (keys[pos] != 0) pos = (pos + 1) & (cap - 1);
++            keys[pos] = k; ai[pos] = (uint32_t)i; bj[pos] = (uint32_t)j;
++            stats[0]++;
++        }
++    }
++    stats[1] = stats[0];
++
++    std::vector<int16_t> probe(h), chk(h);
++    for (int64_t k2 = 0; k2 < nc; k2++) {
++        const int16_t *rc = pafC + k2 * h;
++        for (int64_t l = 0; l < nd; l++) {
++            if (tri2 && (c_off + k2) > (d_off + l)) { stats[6]++; continue; }
++            if (s2 && psd_reject(psdC, psdD, wC, wD, k2, l, F, K, cap2)) {
++                stats[4]++; continue;
++            }
+             combine_rows(rc, pafD + l * h, (int16_t)(-wt2),
+                          probe.data(), h);
+             stats[2]++;
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before9/native.py h668_hardened/native.py
+--- h668_before9/native.py	2026-07-11 03:36:30.275563650 +0000
++++ h668_hardened/native.py	2026-07-11 03:36:32.544058508 +0000
+@@ -39,6 +39,28 @@
+         ctypes.c_longlong, ctypes.c_float, ctypes.c_float,
+         ctypes.POINTER(ctypes.c_longlong),
+         ctypes.POINTER(ctypes.c_longlong)]
++    if hasattr(lib, "match_pairs_v6"):
++        lib.match_pairs_v6.restype = ctypes.c_longlong
++        lib.match_pairs_v6.argtypes = (
++            [ctypes.POINTER(ctypes.c_int16), ctypes.c_longlong] * 4 + [
++                ctypes.c_longlong, ctypes.c_int16, ctypes.c_int16,
++                ctypes.POINTER(ctypes.c_float),
++                ctypes.POINTER(ctypes.c_int32),
++                ctypes.POINTER(ctypes.c_float),
++                ctypes.POINTER(ctypes.c_int32),
++                ctypes.POINTER(ctypes.c_float),
++                ctypes.POINTER(ctypes.c_int32),
++                ctypes.POINTER(ctypes.c_float),
++                ctypes.POINTER(ctypes.c_int32),
++                ctypes.c_longlong, ctypes.c_longlong,
++                ctypes.c_float, ctypes.c_float,
++                ctypes.c_longlong, ctypes.c_longlong,
++                ctypes.c_longlong, ctypes.c_longlong,
++                ctypes.c_int32, ctypes.c_int32,
++                ctypes.POINTER(ctypes.c_longlong),
++                ctypes.POINTER(ctypes.c_longlong),
++                ctypes.POINTER(ctypes.c_longlong), ctypes.c_longlong,
++                ctypes.POINTER(ctypes.c_longlong)])
+     if hasattr(lib, "match_pairs_v5"):
+         lib.match_pairs_v5.restype = ctypes.c_longlong
+         lib.match_pairs_v5.argtypes = (
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before9/tests_canon.py h668_hardened/tests_canon.py
+--- h668_before9/tests_canon.py	1970-01-01 00:00:00.000000000 +0000
++++ h668_hardened/tests_canon.py	2026-07-12 01:43:19.569923763 +0000
+@@ -0,0 +1,206 @@
++"""Canonical orbit dedup: proof tests. Run: python3 tests_canon.py
++House rule: a dedup/restriction ships only if tests prove it never
++removes a known valid construction."""
++import json
++import os
++import shutil
++import subprocess
++import sys
++from collections import defaultdict
++
++import numpy as np
++
++import core
++import engine
++import worker as wk
++
++rng = np.random.default_rng(81)
++PASS = 0
++PY = sys.executable
++WD = "canon_work"
++
++
++def check(name, cond):
++    global PASS
++    if not cond:
++        print(f"FAIL  {name}")
++        sys.exit(1)
++    PASS += 1
++    print(f"ok    {name}")
++
++
++def ctl(args):
++    return subprocess.run([PY, "ctl.py"] + args + ["--workdir", WD],
++                          capture_output=True, text=True, timeout=400)
++
++
++def run_worker(wid, route, n, extra=()):
++    return subprocess.run(
++        [PY, "worker.py", "--route", route, "--n", str(n),
++         "--worker-id", str(wid), "--workdir", WD, "--pool-cap", "300",
++         "--batch", "20000", "--max-pairs", "500000"] + list(extra),
++        capture_output=True, text=True, timeout=300)
++
++
++# ---- 0. same-bin swap: representative property (the soundness proof, ----
++#         checked empirically on pattern (5,5,1,1) where BOTH tri fire) ----
++route = wk.GSRoute(13)
++pat, ((b1, b2), (b3, b4)) = next(
++    (p, s) for p in route.patterns for s in route.splits(p)
++    if s[0][0] == s[0][1] and s[1][0] == s[1][1])
++pools = {s: engine.Pool(13, True) for s in route.bins}
++for s in route.bins:
++    for _ in range(60):
++        if len(pools[s].seqs) >= 90:
++            break
++        pools[s].add(route.generate(s, 20000, rng),
++                     need=90 - len(pools[s].seqs))
++pf = lambda b: core.paf_half_batch(pools[b].seqs)
++A, B, C, D = (pf(b) for b in (b1, b2, b3, b4))
++ref = engine.find_all_matches(A, B, C, D)
++check(f"fixture has solutions on same-bin/same-bin split {((b1,b2),(b3,b4))}",
++      len(ref) > 0)
++rep_ok = all(
++    (min(i, j), max(i, j), min(k, l), max(k, l)) in ref
++    for (i, j, k, l) in ref)
++check("REPRESENTATIVE PROOF: for every exhaustive solution (i,j,k,l), the "
++      "ordered representative (i<=j, k<=l) is ALSO a solution -- the "
++      "matching identity is symmetric in each side's pair", rep_ok)
++
++# ---- 1. tri restriction: same solvability as exhaustive, verified H ----
++s_tri = defaultdict(int)
++hit = engine.match(A, B, C, D, max_pairs=10**9, stats=s_tri,
++                   offs=(0, 0, 0, 0), tri=(True, True))
++check("tri-restricted match finds a solution from the exhaustive set",
++      hit is not None and hit in ref)
++check("tri restriction actually skipped swap pairs",
++      s_tri["swap_skipped"] > 0)
++quad = [pools[b].seqs[x] for b, x in zip((b1, b2, b3, b4), hit)]
++check("tri-found solution assembles and verifies exactly (order 52)",
++      core.verify_hadamard(core.gs_build(quad)) == 52)
++
++# negative control: matchless pools must stay matchless under tri
++tiny = [A[:2], B[:2], C[:2], D[:2]]
++if not engine.find_all_matches(*tiny):
++    r0 = engine.match(*tiny, max_pairs=10**9, offs=(0, 0, 0, 0),
++                      tri=(True, True))
++    check("tri never invents matches on matchless pools", r0 is None)
++else:
++    check("(control skipped: tiny slice had a match)", True)
++
++# ---- 2. blocked coverage: chunk/watermark offsets partition the triangle ----
++nrows = 30
++paf = rng.integers(-30, 30, (nrows, 20)).astype(np.int16)
++s_full = defaultdict(int)
++engine.match(paf, paf, paf[:1] * 0 + 99, paf[:1] * 0 + 98,
++             max_pairs=10**9, stats=s_full, offs=(0, 0, 0, 0),
++             tri=(True, False))
++s_blk = defaultdict(int)
++for lo, hi in ((0, 10), (10, 30)):
++    engine.match(paf[lo:hi], paf, paf[:1] * 0 + 99, paf[:1] * 0 + 98,
++                 max_pairs=10**9, stats=s_blk, offs=(lo, 0, 0, 0),
++                 tri=(True, False))
++check("incremental blocks with global offsets hash EXACTLY the same "
++      "i<=j pairs as one unblocked pass (no pair lost, none doubled)",
++      s_blk["pairs_hashed"] == s_full["pairs_hashed"]
++      == nrows * (nrows + 1) // 2)
++
++# ---- 3. python/native parity with tri + PSD screens together ----
++seqs = rng.choice(np.array([-1, 1], np.int8), (60, 13))
++pafx = core.paf_half_batch(seqs)
++psd = engine.psd_rows_periodic(seqs)
++outs = {}
++for mode in ("1", "0"):
++    os.environ["H668_NATIVE"] = mode
++    engine._LIB = None
++    import native
++    native._STATE.update(lib=None, checked=False, enabled=False,
++                         backend="python", fallback_reason=None)
++    st = defaultdict(int)
++    r = engine.match(pafx, pafx, pafx, pafx, max_pairs=10**9, stats=st,
++                     psd1=(psd, psd, 52.0), psd2=(psd, psd, 52.0),
++                     offs=(0, 0, 0, 0), tri=(True, True))
++    outs[mode] = (r, dict(st))
++os.environ.pop("H668_NATIVE")
++engine._LIB = None
++check("python and native v6 agree: swap_skipped, psd_skipped, "
++      "pairs_hashed, outcome",
++      all(outs["0"][1].get(k, 0) == outs["1"][1].get(k, 0)
++          for k in ("swap_skipped", "psd_skipped", "pairs_hashed"))
++      and (outs["0"][0] is None) == (outs["1"][0] is None))
++
++# ---- 4. end-to-end: workers still solve GS and TT with tri wired in ----
++shutil.rmtree(WD, ignore_errors=True)
++os.makedirs(WD)
++r = run_worker(0, "gs", 13)
++check("GS worker (tri active on same-bin keys) still finds and verifies "
++      "order 52", os.path.exists(os.path.join(WD, "SOLUTION.json")))
++H = np.loadtxt("hadamard_52.csv", delimiter=",", dtype=np.int64)
++check("GS solution verifies independently", core.verify_hadamard(H) == 52)
++os.remove(os.path.join(WD, "SOLUTION.json"))
++os.remove(os.path.join(WD, "STOP"))
++r = run_worker(1, "tt", 4)
++check("TT worker still finds and verifies order 44",
++      os.path.exists(os.path.join(WD, "SOLUTION.json")))
++os.remove(os.path.join(WD, "SOLUTION.json"))
++os.remove(os.path.join(WD, "STOP"))
++
++# ---- 5. canonical merge: dedup, telemetry, solution preservation ----
++# worker 2's pools = orbit transforms of worker 0's pools (pure duplicates)
++src = np.load(os.path.join(WD, "worker_000", "pools.npz"))
++fake = {}
++for k in src.files:
++    arr = src[k].astype(np.int8)
++    rolled = np.roll(arr, 3, axis=1)          # cyclic shift
++    negrev = -arr[:, ::-1]                    # negation + reversal
++    fake[k] = np.concatenate([rolled, negrev])
++os.makedirs(os.path.join(WD, "worker_002"), exist_ok=True)
++np.savez_compressed(os.path.join(WD, "worker_002", "pools.npz"), **fake)
++raw_total = sum(len(src[k]) for k in src.files) + \
++    sum(len(v) for v in fake.values())
++r = ctl(["merge"])
++check("merge prints canonical telemetry (raw/kept/removed per route)",
++      "raw rows read" in r.stdout and "orbit duplicates removed" in
++      r.stdout and "[merge/gs]" in r.stdout and "[merge/tt]" in r.stdout)
++gg = np.load(os.path.join(WD, "global_pools_gs.npz"))
++kept_gs = sum(len(gg[k]) for k in gg.files)
++check("orbit duplicates removed: global smaller than raw union "
++      f"({kept_gs} kept of {raw_total} raw rows incl. planted orbits)",
++      kept_gs < raw_total)
++# no orbit lost: canonical key sets identical before/after
++lost = 0
++for k in gg.files:
++    raw_keys = {core.canonical_key(row, True) for row in
++                np.concatenate([src[k].astype(np.int8), fake[k]])
++                if k in fake} | {core.canonical_key(row, True)
++                                 for row in src[k].astype(np.int8)}
++    kept_keys = {core.canonical_key(row, True)
++                 for row in gg[k].astype(np.int8)}
++    if raw_keys != kept_keys:
++        lost += 1
++check("NO ORBIT LOST: canonical key set of merged global == canonical "
++      "key set of raw union, every bin", lost == 0)
++
++# idempotency
++r2 = ctl(["merge"])
++check("canonical merge is idempotent (second run removes 0)",
++      "orbit duplicates removed: 0" in r2.stdout)
++
++# route safety preserved
++tt = np.load(os.path.join(WD, "global_pools_tt.npz"))
++check("route-safe: gs global has only gs bins, tt only tt bins",
++      all(not k.startswith(("bxy_", "bz_", "bw_")) for k in gg.files)
++      and all(k.startswith(("bxy_", "bz_", "bw_")) for k in tt.files))
++
++# solution preservation through canonical globals: fresh worker absorbs
++# the deduped global and still solves
++r = run_worker(3, "gs", 13, extra=("--seed", "424242"))
++check("fresh worker absorbing canonical-deduped globals still solves",
++      os.path.exists(os.path.join(WD, "SOLUTION.json")))
++
++shutil.rmtree(WD, ignore_errors=True)
++for f in ("hadamard_52.csv", "hadamard_44.csv", "hadamard_52_collision.csv",
++          "hadamard_44_collision.csv"):
++    if os.path.exists(f):
++        os.remove(f)
++print(f"\nALL {PASS} CANONICAL-DEDUP TESTS PASSED")
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before9/worker.py h668_hardened/worker.py
+--- h668_before9/worker.py	2026-07-11 03:36:30.262531870 +0000
++++ h668_hardened/worker.py	2026-07-11 03:38:04.865876562 +0000
+@@ -301,7 +301,9 @@
+                     max_pairs=max_pairs, chunk=chunk, stats=stats,
+                     psd1=(psds[0][a_lo:a_hi], psds[1][b_lo:b_hi], cap1),
+                     psd2=(psds[2][c_lo:c_hi], psds[3][d_lo:d_hi], cap2),
+-                    on_progress=on_progress, collision_log=clog)
++                    on_progress=on_progress, collision_log=clog,
++                    offs=(a_lo, b_lo, c_lo, d_lo),
++                    tri=(b1 == b2, b3 == b4))
+                 if clog:
+                     for (ci, cj, ck, cl) in clog:
+                         gi = (a_lo + ci, b_lo + cj, c_lo + ck, d_lo + cl)

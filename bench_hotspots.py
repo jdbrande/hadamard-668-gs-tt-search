@@ -1,0 +1,531 @@
+#!/usr/bin/env python3
+"""Bottleneck-first speed audit for H668 (proof packet section 14).
+
+STRICTLY READ-ONLY on the workdir: pools, caches, and states are loaded
+into memory; all timing writes go to the system temp directory. Nothing
+under --workdir is created, modified, or deleted.
+
+Measures GS and TT separately, per real per-cycle phase, ranked by
+estimated wall seconds per cycle. Falls back to synthetic fixtures if a
+route has no worker dirs.
+
+Usage: python3 bench_hotspots.py --workdir work
+"""
+import argparse
+import json
+import os
+import tempfile
+import time
+from collections import defaultdict
+
+import numpy as np
+
+import core
+import engine
+import worker as wk
+
+
+def find_worker(workdir, route):
+    """Largest live-or-not worker dir for a route (read-only)."""
+    best, best_size = None, -1
+    for name in sorted(os.listdir(workdir) if os.path.isdir(workdir)
+                       else []):
+        d = os.path.join(workdir, name)
+        if not name.startswith("worker_") or not os.path.isdir(d):
+            continue
+        try:
+            meta = json.load(open(os.path.join(d, "meta.json")))
+        except (OSError, ValueError):
+            continue
+        if meta.get("route") != route:
+            continue
+        p = os.path.join(d, "pools.npz")
+        size = os.path.getsize(p) if os.path.exists(p) else 0
+        if size > best_size:
+            best, best_size = d, size
+    return best
+
+
+def load_pools(route, d):
+    data = np.load(os.path.join(d, "pools.npz"), allow_pickle=False)
+    pools = {}
+    for b in route.bins:
+        bk = wk.bin_key(b)
+        p = engine.Pool(route.lengths[b], route.periodic)
+        if bk in data.files:
+            p.seqs = data[bk].astype(np.int8)
+        else:
+            p.seqs = np.empty((0, route.lengths[b]), np.int8)
+        pools[b] = p
+    return pools
+
+
+def synth_pools(route, rows, rng):
+    pools = {}
+    for b in route.bins:
+        p = engine.Pool(route.lengths[b], route.periodic)
+        p.seqs = rng.choice(np.array([-1, 1], np.int8),
+                            (rows, route.lengths[b]))
+        pools[b] = p
+    return pools
+
+
+def timeit(fn, *a, **kw):
+    t0 = time.perf_counter()
+    out = fn(*a, **kw)
+    return time.perf_counter() - t0, out
+
+
+def audit_route(route_name, workdir, sample_pairs, pool_cap, batch):
+    rng = np.random.default_rng(17)
+    d = find_worker(workdir, route_name)
+    synthetic = d is None
+    n = 167 if route_name == "gs" else 56
+    if d is not None:
+        try:
+            meta = json.load(open(os.path.join(d, "meta.json")))
+            n = int(meta.get("n") or n)
+        except (OSError, ValueError):
+            pass
+    route = wk.GSRoute(n) if route_name == "gs" else wk.TTRoute(n)
+    if synthetic:
+        print(f"\n=== {route_name.upper()} (synthetic fixture: no "
+              f"{route_name} worker dirs in {workdir}) ===")
+        pools = synth_pools(route, 5000, rng)
+        state = None
+    else:
+        print(f"\n=== {route_name.upper()} (real data: {d}, read-only) "
+              f"===")
+        pools = load_pools(route, d)
+        state = wk.MatchState(os.path.join(d, "matchstate.json"))
+        try:
+            state.load(pools, wk.bin_key)
+        except Exception:
+            state = None
+    sizes = {str(b): len(p.seqs) for b, p in pools.items()}
+    capped = sum(1 for v in sizes.values() if pool_cap and
+                 v >= pool_cap)
+    print(f"pools: {sum(sizes.values()):,} rows across {len(sizes)} "
+          f"bins; {capped} at cap ({pool_cap:,})")
+    rows = []  # (phase, secs, est_per_cycle, note)
+
+    # --- 1. generation + build sieve, one roomy bin and one tight bin ---
+    by_room = sorted(pools, key=lambda b: len(pools[b].seqs))
+    for label, b in (("roomiest bin", by_room[0]),
+                     ("fullest bin", by_room[-1])):
+        t, out = timeit(route.generate, b, batch, rng)
+        n_bins_open = sum(1 for bb in pools
+                          if len(pools[bb].seqs) < pool_cap) or 1
+        rows.append((f"generate+sieve ({label} {b}, {batch:,})", t,
+                     t * n_bins_open,
+                     f"{len(out):,} pass sieve "
+                     f"({100*len(out)/batch:.2f}%); est x{n_bins_open} "
+                     f"open bins/cycle"))
+        gen_batch = out
+
+    # --- 2. Pool.add canonical dedup on the last generated batch ---
+    if len(gen_batch):
+        pc = engine.Pool(route.lengths[by_room[-1]], route.periodic)
+        pc.seqs = pools[by_room[-1]].seqs.copy()
+        for row in pc.seqs:
+            pc.keys.add(core.canonical_key(row, route.periodic))
+        t, _ = timeit(pc.add, gen_batch, need=len(gen_batch))
+        dup = 1 - (len(pc.seqs) - len(pools[by_room[-1]].seqs)) \
+            / max(len(gen_batch), 1)
+        rows.append(("Pool.add canonical dedup", t, t * (
+            sum(1 for bb in pools if len(pools[bb].seqs) < pool_cap)
+            or 1),
+            f"{len(gen_batch):,} rows, dup {100*dup:.0f}%"))
+
+    # --- 3. PAF cache build (route.paf over the fullest bin) ---
+    big = pools[by_room[-1]].seqs
+    t, paf = timeit(route.paf, big)
+    rows.append((f"PAF cache build ({len(big):,} rows)", t,
+                 t * len(pools),
+                 "only on cache miss/absorb; x bins worst case"))
+
+    # --- 4. PSD cache build ---
+    if route.periodic:
+        t, psd = timeit(engine.psd_rows_periodic, big)
+    else:
+        t, psd = timeit(engine.psd_rows_padded, big, 128)
+    rows.append((f"PSD cache build ({len(big):,} rows)", t,
+                 t * len(pools),
+                 "only on cache miss/absorb; x bins worst case"))
+
+    # --- 5. checkpoint: pools.npz save (to system temp, not workdir) ---
+    arrays = {wk.bin_key(b): p.seqs for b, p in pools.items()}
+    with tempfile.NamedTemporaryFile(suffix=".npz", delete=True) as tf:
+        t, _ = timeit(np.savez_compressed, tf.name, **arrays)
+    rows.append(("checkpoint: pools.npz savez_compressed", t, t,
+                 f"EVERY cycle, all {len(arrays)} bins, even unchanged "
+                 f"capped ones"))
+
+    # --- 6. checkpoint: caches.npz save (PAF+PSD for all bins) ---
+    carrays = {}
+    for b, p in pools.items():
+        carrays[f"paf_{wk.bin_key(b)}"] = route.paf(p.seqs) \
+            if len(p.seqs) else np.empty((0, 1), np.int16)
+        if route.periodic:
+            carrays[f"psd_{wk.bin_key(b)}"] = \
+                engine.psd_rows_periodic(p.seqs) if len(p.seqs) \
+                else np.empty((0, 1), np.float32)
+        else:
+            carrays[f"psd_{wk.bin_key(b)}"] = \
+                engine.psd_rows_padded(p.seqs, 128) if len(p.seqs) \
+                else np.empty((0, 1), np.float32)
+    with tempfile.NamedTemporaryFile(suffix=".npz", delete=True) as tf:
+        t, _ = timeit(lambda: np.savez_compressed(tf.name, **carrays))
+    csz = sum(a.nbytes for a in carrays.values())
+    rows.append(("checkpoint: caches.npz save", t, t,
+                 f"EVERY cycle, {csz/1e6:,.0f} MB raw, incl. unchanged "
+                 f"capped bins"))
+
+    # --- 7. matching: pending blocks from the REAL watermarks ---
+    pend_total, sampled_rate, match_est = 0, None, 0.0
+    keys_info = []
+    for pi, pat in enumerate(route.patterns):
+        for si, ((b1, b2), (b3, b4)) in enumerate(route.splits(pat)):
+            bins = (b1, b2, b3, b4)
+            L = [len(pools[b].seqs) for b in bins]
+            if min(L) == 0:
+                continue
+            key = f"{route.name}|{pi}|{si}"
+            o = [0, 0, 0, 0]
+            if state is not None:
+                got = state.get(key, [str(b) for b in bins])
+                o = [got[str(b)] for b in bins]
+            blocks = [((o[0], L[0]), (0, L[1])),
+                      ((0, o[0]), (o[1], L[1]))]
+            pend = sum((ah - al) * (bh - bl)
+                       for (al, ah), (bl, bh) in blocks
+                       if ah > al and bh > bl)
+            pend_total += pend
+            keys_info.append((key, pend, bins))
+    keys_info.sort(key=lambda x: -x[1])
+    if keys_info and keys_info[0][1] > 0:
+        key, pend, bins = keys_info[0]
+        pf = {b: route.paf(pools[b].seqs[:2000]) for b in set(bins)}
+        s = defaultdict(int)
+        t, _ = timeit(engine.match, pf[bins[0]], pf[bins[1]],
+                      pf[bins[2]], pf[bins[3]],
+                      max_pairs=sample_pairs, stats=s)
+        done = s["pairs_hashed"] + s["probes"]
+        sampled_rate = done / t if t > 0 else 0
+        match_est = 2 * pend_total / max(sampled_rate, 1)
+    # true cost under each engine (the naive 2x estimate hid the
+    # legacy chunk x full-reprobe multiplication; see ctl match-audit)
+    note = (f"rate sampled {sampled_rate:,.0f}/s; run ctl.py match-audit "
+            f"for per-key true chunked vs partitioned ops"
+            if sampled_rate else "no pending work (watermarked)")
+    rows.append((f"matching (pending {2*pend_total:,} pair-ops over "
+                 f"{sum(1 for k in keys_info if k[1] > 0)} keys; "
+                 f"LOWER BOUND -- legacy engine multiplies probe work "
+                 f"by its chunk count)",
+                 0.0, match_est, note))
+
+    # --- 8. telemetry write ---
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=True) as tf:
+        t, _ = timeit(lambda: json.dump({"x": sizes},
+                                        open(tf.name, "w")))
+    rows.append(("telemetry/progress write", t, t, "negligible"))
+
+    total = sum(r[2] for r in rows)
+    rows.sort(key=lambda r: -r[2])
+    print(f"{'phase':<52} {'measured':>9} {'est/cycle':>10} "
+          f"{'%cycle':>7}  note")
+    for name, t, est, note in rows:
+        print(f"{name:<52} {t:>8.2f}s {est:>9.2f}s "
+              f"{100*est/max(total,1e-9):>6.1f}%  {note}")
+    print(f"{'ESTIMATED CYCLE TOTAL':<52} {'':>9} {total:>9.2f}s")
+    return rows, total
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--workdir", default="work")
+    ap.add_argument("--route", default="both", choices=["both", "gs",
+                                                        "tt"])
+    ap.add_argument("--pool-cap", type=int,
+                    default=int(os.environ.get("H668_POOL_CAP",
+                                               "100000")))
+    ap.add_argument("--batch", type=int, default=200000)
+    ap.add_argument("--sample-pairs", type=int, default=4_000_000)
+    a = ap.parse_args()
+    print("READ-ONLY audit: nothing under the workdir is written.")
+    for r in (("gs", "tt") if a.route == "both" else (a.route,)):
+        audit_route(r, a.workdir, a.sample_pairs, a.pool_cap, a.batch)
+    print("\nInterpretation guide (proof packet):")
+    print(" * checkpoint phases -> rule 11 (churn reduction is "
+          "scheduling, explicitly safe)")
+    print(" * generate/dedup in dup-saturated bins -> rule 11 "
+          "(prioritize bins with room; reachability must be proven)")
+    print(" * matching -> rules 5-7 only (no new candidate filters "
+          "without proof tests)")
+
+
+if __name__ == "__main__":
+    main()
+#!/usr/bin/env python3
+"""Bottleneck-first speed audit for H668 (proof packet section 14).
+
+STRICTLY READ-ONLY on the workdir: pools, caches, and states are loaded
+into memory; all timing writes go to the system temp directory. Nothing
+under --workdir is created, modified, or deleted.
+
+Measures GS and TT separately, per real per-cycle phase, ranked by
+estimated wall seconds per cycle. Falls back to synthetic fixtures if a
+route has no worker dirs.
+
+Usage: python3 bench_hotspots.py --workdir work
+"""
+import argparse
+import json
+import os
+import tempfile
+import time
+from collections import defaultdict
+
+import numpy as np
+
+import core
+import engine
+import worker as wk
+
+
+def find_worker(workdir, route):
+    """Largest live-or-not worker dir for a route (read-only)."""
+    best, best_size = None, -1
+    for name in sorted(os.listdir(workdir) if os.path.isdir(workdir)
+                       else []):
+        d = os.path.join(workdir, name)
+        if not name.startswith("worker_") or not os.path.isdir(d):
+            continue
+        try:
+            meta = json.load(open(os.path.join(d, "meta.json")))
+        except (OSError, ValueError):
+            continue
+        if meta.get("route") != route:
+            continue
+        p = os.path.join(d, "pools.npz")
+        size = os.path.getsize(p) if os.path.exists(p) else 0
+        if size > best_size:
+            best, best_size = d, size
+    return best
+
+
+def load_pools(route, d):
+    data = np.load(os.path.join(d, "pools.npz"), allow_pickle=False)
+    pools = {}
+    for b in route.bins:
+        bk = wk.bin_key(b)
+        p = engine.Pool(route.lengths[b], route.periodic)
+        if bk in data.files:
+            p.seqs = data[bk].astype(np.int8)
+        else:
+            p.seqs = np.empty((0, route.lengths[b]), np.int8)
+        pools[b] = p
+    return pools
+
+
+def synth_pools(route, rows, rng):
+    pools = {}
+    for b in route.bins:
+        p = engine.Pool(route.lengths[b], route.periodic)
+        p.seqs = rng.choice(np.array([-1, 1], np.int8),
+                            (rows, route.lengths[b]))
+        pools[b] = p
+    return pools
+
+
+def timeit(fn, *a, **kw):
+    t0 = time.perf_counter()
+    out = fn(*a, **kw)
+    return time.perf_counter() - t0, out
+
+
+def audit_route(route_name, workdir, sample_pairs, pool_cap, batch):
+    rng = np.random.default_rng(17)
+    d = find_worker(workdir, route_name)
+    synthetic = d is None
+    n = 167 if route_name == "gs" else 56
+    if d is not None:
+        try:
+            meta = json.load(open(os.path.join(d, "meta.json")))
+            n = int(meta.get("n") or n)
+        except (OSError, ValueError):
+            pass
+    route = wk.GSRoute(n) if route_name == "gs" else wk.TTRoute(n)
+    if synthetic:
+        print(f"\n=== {route_name.upper()} (synthetic fixture: no "
+              f"{route_name} worker dirs in {workdir}) ===")
+        pools = synth_pools(route, 5000, rng)
+        state = None
+    else:
+        print(f"\n=== {route_name.upper()} (real data: {d}, read-only) "
+              f"===")
+        pools = load_pools(route, d)
+        state = wk.MatchState(os.path.join(d, "matchstate.json"))
+        try:
+            state.load(pools, wk.bin_key)
+        except Exception:
+            state = None
+    sizes = {str(b): len(p.seqs) for b, p in pools.items()}
+    capped = sum(1 for v in sizes.values() if pool_cap and
+                 v >= pool_cap)
+    print(f"pools: {sum(sizes.values()):,} rows across {len(sizes)} "
+          f"bins; {capped} at cap ({pool_cap:,})")
+    rows = []  # (phase, secs, est_per_cycle, note)
+
+    # --- 1. generation + build sieve, one roomy bin and one tight bin ---
+    by_room = sorted(pools, key=lambda b: len(pools[b].seqs))
+    for label, b in (("roomiest bin", by_room[0]),
+                     ("fullest bin", by_room[-1])):
+        t, out = timeit(route.generate, b, batch, rng)
+        n_bins_open = sum(1 for bb in pools
+                          if len(pools[bb].seqs) < pool_cap) or 1
+        rows.append((f"generate+sieve ({label} {b}, {batch:,})", t,
+                     t * n_bins_open,
+                     f"{len(out):,} pass sieve "
+                     f"({100*len(out)/batch:.2f}%); est x{n_bins_open} "
+                     f"open bins/cycle"))
+        gen_batch = out
+
+    # --- 2. Pool.add canonical dedup on the last generated batch ---
+    if len(gen_batch):
+        pc = engine.Pool(route.lengths[by_room[-1]], route.periodic)
+        pc.seqs = pools[by_room[-1]].seqs.copy()
+        for row in pc.seqs:
+            pc.keys.add(core.canonical_key(row, route.periodic))
+        t, _ = timeit(pc.add, gen_batch, need=len(gen_batch))
+        dup = 1 - (len(pc.seqs) - len(pools[by_room[-1]].seqs)) \
+            / max(len(gen_batch), 1)
+        rows.append(("Pool.add canonical dedup", t, t * (
+            sum(1 for bb in pools if len(pools[bb].seqs) < pool_cap)
+            or 1),
+            f"{len(gen_batch):,} rows, dup {100*dup:.0f}%"))
+
+    # --- 3. PAF cache build (route.paf over the fullest bin) ---
+    big = pools[by_room[-1]].seqs
+    t, paf = timeit(route.paf, big)
+    rows.append((f"PAF cache build ({len(big):,} rows)", t,
+                 t * len(pools),
+                 "only on cache miss/absorb; x bins worst case"))
+
+    # --- 4. PSD cache build ---
+    if route.periodic:
+        t, psd = timeit(engine.psd_rows_periodic, big)
+    else:
+        t, psd = timeit(engine.psd_rows_padded, big, 128)
+    rows.append((f"PSD cache build ({len(big):,} rows)", t,
+                 t * len(pools),
+                 "only on cache miss/absorb; x bins worst case"))
+
+    # --- 5. checkpoint: pools.npz save (to system temp, not workdir) ---
+    arrays = {wk.bin_key(b): p.seqs for b, p in pools.items()}
+    with tempfile.NamedTemporaryFile(suffix=".npz", delete=True) as tf:
+        t, _ = timeit(np.savez_compressed, tf.name, **arrays)
+    rows.append(("checkpoint: pools.npz savez_compressed", t, t,
+                 f"EVERY cycle, all {len(arrays)} bins, even unchanged "
+                 f"capped ones"))
+
+    # --- 6. checkpoint: caches.npz save (PAF+PSD for all bins) ---
+    carrays = {}
+    for b, p in pools.items():
+        carrays[f"paf_{wk.bin_key(b)}"] = route.paf(p.seqs) \
+            if len(p.seqs) else np.empty((0, 1), np.int16)
+        if route.periodic:
+            carrays[f"psd_{wk.bin_key(b)}"] = \
+                engine.psd_rows_periodic(p.seqs) if len(p.seqs) \
+                else np.empty((0, 1), np.float32)
+        else:
+            carrays[f"psd_{wk.bin_key(b)}"] = \
+                engine.psd_rows_padded(p.seqs, 128) if len(p.seqs) \
+                else np.empty((0, 1), np.float32)
+    with tempfile.NamedTemporaryFile(suffix=".npz", delete=True) as tf:
+        t, _ = timeit(lambda: np.savez_compressed(tf.name, **carrays))
+    csz = sum(a.nbytes for a in carrays.values())
+    rows.append(("checkpoint: caches.npz save", t, t,
+                 f"EVERY cycle, {csz/1e6:,.0f} MB raw, incl. unchanged "
+                 f"capped bins"))
+
+    # --- 7. matching: pending blocks from the REAL watermarks ---
+    pend_total, sampled_rate, match_est = 0, None, 0.0
+    keys_info = []
+    for pi, pat in enumerate(route.patterns):
+        for si, ((b1, b2), (b3, b4)) in enumerate(route.splits(pat)):
+            bins = (b1, b2, b3, b4)
+            L = [len(pools[b].seqs) for b in bins]
+            if min(L) == 0:
+                continue
+            key = f"{route.name}|{pi}|{si}"
+            o = [0, 0, 0, 0]
+            if state is not None:
+                got = state.get(key, [str(b) for b in bins])
+                o = [got[str(b)] for b in bins]
+            blocks = [((o[0], L[0]), (0, L[1])),
+                      ((0, o[0]), (o[1], L[1]))]
+            pend = sum((ah - al) * (bh - bl)
+                       for (al, ah), (bl, bh) in blocks
+                       if ah > al and bh > bl)
+            pend_total += pend
+            keys_info.append((key, pend, bins))
+    keys_info.sort(key=lambda x: -x[1])
+    if keys_info and keys_info[0][1] > 0:
+        key, pend, bins = keys_info[0]
+        pf = {b: route.paf(pools[b].seqs[:2000]) for b in set(bins)}
+        s = defaultdict(int)
+        t, _ = timeit(engine.match, pf[bins[0]], pf[bins[1]],
+                      pf[bins[2]], pf[bins[3]],
+                      max_pairs=sample_pairs, stats=s)
+        done = s["pairs_hashed"] + s["probes"]
+        sampled_rate = done / t if t > 0 else 0
+        match_est = 2 * pend_total / max(sampled_rate, 1)
+    rows.append((f"matching (pending {2*pend_total:,} pair-ops over "
+                 f"{sum(1 for k in keys_info if k[1] > 0)} keys)",
+                 0.0, match_est,
+                 f"rate sampled {sampled_rate:,.0f}/s"
+                 if sampled_rate else "no pending work (watermarked)"))
+
+    # --- 8. telemetry write ---
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=True) as tf:
+        t, _ = timeit(lambda: json.dump({"x": sizes},
+                                        open(tf.name, "w")))
+    rows.append(("telemetry/progress write", t, t, "negligible"))
+
+    total = sum(r[2] for r in rows)
+    rows.sort(key=lambda r: -r[2])
+    print(f"{'phase':<52} {'measured':>9} {'est/cycle':>10} "
+          f"{'%cycle':>7}  note")
+    for name, t, est, note in rows:
+        print(f"{name:<52} {t:>8.2f}s {est:>9.2f}s "
+              f"{100*est/max(total,1e-9):>6.1f}%  {note}")
+    print(f"{'ESTIMATED CYCLE TOTAL':<52} {'':>9} {total:>9.2f}s")
+    return rows, total
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--workdir", default="work")
+    ap.add_argument("--route", default="both", choices=["both", "gs",
+                                                        "tt"])
+    ap.add_argument("--pool-cap", type=int,
+                    default=int(os.environ.get("H668_POOL_CAP",
+                                               "100000")))
+    ap.add_argument("--batch", type=int, default=200000)
+    ap.add_argument("--sample-pairs", type=int, default=4_000_000)
+    a = ap.parse_args()
+    print("READ-ONLY audit: nothing under the workdir is written.")
+    for r in (("gs", "tt") if a.route == "both" else (a.route,)):
+        audit_route(r, a.workdir, a.sample_pairs, a.pool_cap, a.batch)
+    print("\nInterpretation guide (proof packet):")
+    print(" * checkpoint phases -> rule 11 (churn reduction is "
+          "scheduling, explicitly safe)")
+    print(" * generate/dedup in dup-saturated bins -> rule 11 "
+          "(prioritize bins with room; reachability must be proven)")
+    print(" * matching -> rules 5-7 only (no new candidate filters "
+          "without proof tests)")
+
+
+if __name__ == "__main__":
+    main()

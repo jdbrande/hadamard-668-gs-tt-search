@@ -1,0 +1,1101 @@
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before12/bench_hotspots.py h668_hardened/bench_hotspots.py
+--- h668_before12/bench_hotspots.py	1970-01-01 00:00:00.000000000 +0000
++++ h668_hardened/bench_hotspots.py	2026-07-12 12:00:49.437242587 +0000
+@@ -0,0 +1,268 @@
++#!/usr/bin/env python3
++"""Bottleneck-first speed audit for H668 (proof packet section 14).
++
++STRICTLY READ-ONLY on the workdir: pools, caches, and states are loaded
++into memory; all timing writes go to the system temp directory. Nothing
++under --workdir is created, modified, or deleted.
++
++Measures GS and TT separately, per real per-cycle phase, ranked by
++estimated wall seconds per cycle. Falls back to synthetic fixtures if a
++route has no worker dirs.
++
++Usage: python3 bench_hotspots.py --workdir work
++"""
++import argparse
++import json
++import os
++import tempfile
++import time
++from collections import defaultdict
++
++import numpy as np
++
++import core
++import engine
++import worker as wk
++
++
++def find_worker(workdir, route):
++    """Largest live-or-not worker dir for a route (read-only)."""
++    best, best_size = None, -1
++    for name in sorted(os.listdir(workdir) if os.path.isdir(workdir)
++                       else []):
++        d = os.path.join(workdir, name)
++        if not name.startswith("worker_") or not os.path.isdir(d):
++            continue
++        try:
++            meta = json.load(open(os.path.join(d, "meta.json")))
++        except (OSError, ValueError):
++            continue
++        if meta.get("route") != route:
++            continue
++        p = os.path.join(d, "pools.npz")
++        size = os.path.getsize(p) if os.path.exists(p) else 0
++        if size > best_size:
++            best, best_size = d, size
++    return best
++
++
++def load_pools(route, d):
++    data = np.load(os.path.join(d, "pools.npz"), allow_pickle=False)
++    pools = {}
++    for b in route.bins:
++        bk = wk.bin_key(b)
++        p = engine.Pool(route.lengths[b], route.periodic)
++        if bk in data.files:
++            p.seqs = data[bk].astype(np.int8)
++        else:
++            p.seqs = np.empty((0, route.lengths[b]), np.int8)
++        pools[b] = p
++    return pools
++
++
++def synth_pools(route, rows, rng):
++    pools = {}
++    for b in route.bins:
++        p = engine.Pool(route.lengths[b], route.periodic)
++        p.seqs = rng.choice(np.array([-1, 1], np.int8),
++                            (rows, route.lengths[b]))
++        pools[b] = p
++    return pools
++
++
++def timeit(fn, *a, **kw):
++    t0 = time.perf_counter()
++    out = fn(*a, **kw)
++    return time.perf_counter() - t0, out
++
++
++def audit_route(route_name, workdir, sample_pairs, pool_cap, batch):
++    rng = np.random.default_rng(17)
++    d = find_worker(workdir, route_name)
++    synthetic = d is None
++    n = 167 if route_name == "gs" else 56
++    if d is not None:
++        try:
++            meta = json.load(open(os.path.join(d, "meta.json")))
++            n = int(meta.get("n") or n)
++        except (OSError, ValueError):
++            pass
++    route = wk.GSRoute(n) if route_name == "gs" else wk.TTRoute(n)
++    if synthetic:
++        print(f"\n=== {route_name.upper()} (synthetic fixture: no "
++              f"{route_name} worker dirs in {workdir}) ===")
++        pools = synth_pools(route, 5000, rng)
++        state = None
++    else:
++        print(f"\n=== {route_name.upper()} (real data: {d}, read-only) "
++              f"===")
++        pools = load_pools(route, d)
++        state = wk.MatchState(os.path.join(d, "matchstate.json"))
++        try:
++            state.load(pools, wk.bin_key)
++        except Exception:
++            state = None
++    sizes = {str(b): len(p.seqs) for b, p in pools.items()}
++    capped = sum(1 for v in sizes.values() if pool_cap and
++                 v >= pool_cap)
++    print(f"pools: {sum(sizes.values()):,} rows across {len(sizes)} "
++          f"bins; {capped} at cap ({pool_cap:,})")
++    rows = []  # (phase, secs, est_per_cycle, note)
++
++    # --- 1. generation + build sieve, one roomy bin and one tight bin ---
++    by_room = sorted(pools, key=lambda b: len(pools[b].seqs))
++    for label, b in (("roomiest bin", by_room[0]),
++                     ("fullest bin", by_room[-1])):
++        t, out = timeit(route.generate, b, batch, rng)
++        n_bins_open = sum(1 for bb in pools
++                          if len(pools[bb].seqs) < pool_cap) or 1
++        rows.append((f"generate+sieve ({label} {b}, {batch:,})", t,
++                     t * n_bins_open,
++                     f"{len(out):,} pass sieve "
++                     f"({100*len(out)/batch:.2f}%); est x{n_bins_open} "
++                     f"open bins/cycle"))
++        gen_batch = out
++
++    # --- 2. Pool.add canonical dedup on the last generated batch ---
++    if len(gen_batch):
++        pc = engine.Pool(route.lengths[by_room[-1]], route.periodic)
++        pc.seqs = pools[by_room[-1]].seqs.copy()
++        for row in pc.seqs:
++            pc.keys.add(core.canonical_key(row, route.periodic))
++        t, _ = timeit(pc.add, gen_batch, need=len(gen_batch))
++        dup = 1 - (len(pc.seqs) - len(pools[by_room[-1]].seqs)) \
++            / max(len(gen_batch), 1)
++        rows.append(("Pool.add canonical dedup", t, t * (
++            sum(1 for bb in pools if len(pools[bb].seqs) < pool_cap)
++            or 1),
++            f"{len(gen_batch):,} rows, dup {100*dup:.0f}%"))
++
++    # --- 3. PAF cache build (route.paf over the fullest bin) ---
++    big = pools[by_room[-1]].seqs
++    t, paf = timeit(route.paf, big)
++    rows.append((f"PAF cache build ({len(big):,} rows)", t,
++                 t * len(pools),
++                 "only on cache miss/absorb; x bins worst case"))
++
++    # --- 4. PSD cache build ---
++    if route.periodic:
++        t, psd = timeit(engine.psd_rows_periodic, big)
++    else:
++        t, psd = timeit(engine.psd_rows_padded, big, 128)
++    rows.append((f"PSD cache build ({len(big):,} rows)", t,
++                 t * len(pools),
++                 "only on cache miss/absorb; x bins worst case"))
++
++    # --- 5. checkpoint: pools.npz save (to system temp, not workdir) ---
++    arrays = {wk.bin_key(b): p.seqs for b, p in pools.items()}
++    with tempfile.NamedTemporaryFile(suffix=".npz", delete=True) as tf:
++        t, _ = timeit(np.savez_compressed, tf.name, **arrays)
++    rows.append(("checkpoint: pools.npz savez_compressed", t, t,
++                 f"EVERY cycle, all {len(arrays)} bins, even unchanged "
++                 f"capped ones"))
++
++    # --- 6. checkpoint: caches.npz save (PAF+PSD for all bins) ---
++    carrays = {}
++    for b, p in pools.items():
++        carrays[f"paf_{wk.bin_key(b)}"] = route.paf(p.seqs) \
++            if len(p.seqs) else np.empty((0, 1), np.int16)
++        if route.periodic:
++            carrays[f"psd_{wk.bin_key(b)}"] = \
++                engine.psd_rows_periodic(p.seqs) if len(p.seqs) \
++                else np.empty((0, 1), np.float32)
++        else:
++            carrays[f"psd_{wk.bin_key(b)}"] = \
++                engine.psd_rows_padded(p.seqs, 128) if len(p.seqs) \
++                else np.empty((0, 1), np.float32)
++    with tempfile.NamedTemporaryFile(suffix=".npz", delete=True) as tf:
++        t, _ = timeit(lambda: np.savez_compressed(tf.name, **carrays))
++    csz = sum(a.nbytes for a in carrays.values())
++    rows.append(("checkpoint: caches.npz save", t, t,
++                 f"EVERY cycle, {csz/1e6:,.0f} MB raw, incl. unchanged "
++                 f"capped bins"))
++
++    # --- 7. matching: pending blocks from the REAL watermarks ---
++    pend_total, sampled_rate, match_est = 0, None, 0.0
++    keys_info = []
++    for pi, pat in enumerate(route.patterns):
++        for si, ((b1, b2), (b3, b4)) in enumerate(route.splits(pat)):
++            bins = (b1, b2, b3, b4)
++            L = [len(pools[b].seqs) for b in bins]
++            if min(L) == 0:
++                continue
++            key = f"{route.name}|{pi}|{si}"
++            o = [0, 0, 0, 0]
++            if state is not None:
++                got = state.get(key, [str(b) for b in bins])
++                o = [got[str(b)] for b in bins]
++            blocks = [((o[0], L[0]), (0, L[1])),
++                      ((0, o[0]), (o[1], L[1]))]
++            pend = sum((ah - al) * (bh - bl)
++                       for (al, ah), (bl, bh) in blocks
++                       if ah > al and bh > bl)
++            pend_total += pend
++            keys_info.append((key, pend, bins))
++    keys_info.sort(key=lambda x: -x[1])
++    if keys_info and keys_info[0][1] > 0:
++        key, pend, bins = keys_info[0]
++        pf = {b: route.paf(pools[b].seqs[:2000]) for b in set(bins)}
++        s = defaultdict(int)
++        t, _ = timeit(engine.match, pf[bins[0]], pf[bins[1]],
++                      pf[bins[2]], pf[bins[3]],
++                      max_pairs=sample_pairs, stats=s)
++        done = s["pairs_hashed"] + s["probes"]
++        sampled_rate = done / t if t > 0 else 0
++        match_est = 2 * pend_total / max(sampled_rate, 1)
++    # true cost under each engine (the naive 2x estimate hid the
++    # legacy chunk x full-reprobe multiplication; see ctl match-audit)
++    note = (f"rate sampled {sampled_rate:,.0f}/s; run ctl.py match-audit "
++            f"for per-key true chunked vs partitioned ops"
++            if sampled_rate else "no pending work (watermarked)")
++    rows.append((f"matching (pending {2*pend_total:,} pair-ops over "
++                 f"{sum(1 for k in keys_info if k[1] > 0)} keys; "
++                 f"LOWER BOUND -- legacy engine multiplies probe work "
++                 f"by its chunk count)",
++                 0.0, match_est, note))
++
++    # --- 8. telemetry write ---
++    with tempfile.NamedTemporaryFile(suffix=".json", delete=True) as tf:
++        t, _ = timeit(lambda: json.dump({"x": sizes},
++                                        open(tf.name, "w")))
++    rows.append(("telemetry/progress write", t, t, "negligible"))
++
++    total = sum(r[2] for r in rows)
++    rows.sort(key=lambda r: -r[2])
++    print(f"{'phase':<52} {'measured':>9} {'est/cycle':>10} "
++          f"{'%cycle':>7}  note")
++    for name, t, est, note in rows:
++        print(f"{name:<52} {t:>8.2f}s {est:>9.2f}s "
++              f"{100*est/max(total,1e-9):>6.1f}%  {note}")
++    print(f"{'ESTIMATED CYCLE TOTAL':<52} {'':>9} {total:>9.2f}s")
++    return rows, total
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--workdir", default="work")
++    ap.add_argument("--route", default="both", choices=["both", "gs",
++                                                        "tt"])
++    ap.add_argument("--pool-cap", type=int,
++                    default=int(os.environ.get("H668_POOL_CAP",
++                                               "100000")))
++    ap.add_argument("--batch", type=int, default=200000)
++    ap.add_argument("--sample-pairs", type=int, default=4_000_000)
++    a = ap.parse_args()
++    print("READ-ONLY audit: nothing under the workdir is written.")
++    for r in (("gs", "tt") if a.route == "both" else (a.route,)):
++        audit_route(r, a.workdir, a.sample_pairs, a.pool_cap, a.batch)
++    print("\nInterpretation guide (proof packet):")
++    print(" * checkpoint phases -> rule 11 (churn reduction is "
++          "scheduling, explicitly safe)")
++    print(" * generate/dedup in dup-saturated bins -> rule 11 "
++          "(prioritize bins with room; reachability must be proven)")
++    print(" * matching -> rules 5-7 only (no new candidate filters "
++          "without proof tests)")
++
++
++if __name__ == "__main__":
++    main()
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before12/ctl.py h668_hardened/ctl.py
+--- h668_before12/ctl.py	2026-07-12 03:01:33.777381637 +0000
++++ h668_hardened/ctl.py	2026-07-12 11:55:21.215282549 +0000
+@@ -1610,6 +1610,146 @@
+             pass
+ 
+ 
++def _compatible_pair_ops(route, pools, bins):
++    """Exact count of build/probe pairs whose FIRST PAF coordinate sums
++    are mutually compatible (a necessary condition for an exact match):
++    wt1*(a0+b0) + wt2*(c0+d0) = 0. Computed via histogram convolution."""
++    pafs = [route.paf(pools[b].seqs)[:, 0].astype(np.int64)
++            for b in bins]
++    w1, w2 = route.wt
++
++    def conv(x, y):
++        mn = int(x.min() + y.min()) if len(x) and len(y) else 0
++        hx = np.bincount(x - x.min()) if len(x) else np.array([0])
++        hy = np.bincount(y - y.min()) if len(y) else np.array([0])
++        return np.convolve(hx, hy), mn
++    h1, m1 = conv(pafs[0], pafs[1])
++    h2, m2 = conv(pafs[2], pafs[3])
++    build = probe = 0
++    for t1_off, cnt1 in enumerate(h1):
++        if not cnt1:
++            continue
++        t1 = m1 + t1_off
++        num = -w1 * t1
++        if num % w2:
++            continue
++        t2 = num // w2
++        idx = t2 - m2
++        if 0 <= idx < len(h2) and h2[idx]:
++            build += int(cnt1)
++            probe += int(h2[idx])
++    return build, probe
++
++
++def match_audit(a):
++    """Per-key matching cost audit: what the watermarks cover, what is
++    genuinely pending, what the CURRENT engine will actually spend on it
++    (including the chunk x full-reprobe multiplication), and what a
++    partition-compatible engine would spend. READ-ONLY."""
++    import worker as wkm
++    import engine
++    for d in worker_dirs(a.workdir):
++        wid = int(os.path.basename(d).split("_")[1])
++        try:
++            meta = json.load(open(os.path.join(d, "meta.json")))
++        except (OSError, ValueError):
++            continue
++        rname = meta.get("route")
++        n = meta.get("n") or (167 if rname == "gs" else 56)
++        route = wkm.GSRoute(n) if rname == "gs" else wkm.TTRoute(n)
++        ppath = os.path.join(d, "pools.npz")
++        spath = os.path.join(d, "matchstate.json")
++        if not os.path.exists(ppath):
++            continue
++        data = np.load(ppath, allow_pickle=False)
++        pools = {}
++        for b in route.bins:
++            bk = wkm.bin_key(b)
++            p = engine.Pool(route.lengths[b], route.periodic)
++            p.seqs = (data[bk].astype(np.int8) if bk in data.files
++                      else np.empty((0, route.lengths[b]), np.int8))
++            pools[b] = p
++        raw_state = {}
++        try:
++            raw_state = json.load(open(spath))
++        except (OSError, ValueError):
++            pass
++        opt_ok = raw_state.get("opt_version") == wkm.OPT_VERSION
++        st = wkm.MatchState(spath)
++        fp_status = "no state file"
++        if raw_state:
++            try:
++                st.load(pools, wkm.bin_key)
++                fp_status = ("valid" if st.marks else
++                             "DISCARDED (fingerprint/opt mismatch)")
++            except Exception as exc:
++                fp_status = f"load error: {exc}"
++        mtime = (time.strftime("%F %T", time.localtime(
++            os.path.getmtime(spath))) if os.path.exists(spath) else "-")
++        print(f"\n=== worker {wid} route={rname} n={n} ===")
++        print(f"matchstate: opt_version "
++              f"{'OK' if opt_ok else 'MISMATCH -> discard'}"
++              f" ({raw_state.get('opt_version')} vs {wkm.OPT_VERSION}); "
++              f"fingerprints {fp_status}; last update {mtime}")
++        tot_cur = tot_part = 0
++        for pi, pat in enumerate(route.patterns):
++            for si, ((b1, b2), (b3, b4)) in enumerate(route.splits(pat)):
++                bins = (b1, b2, b3, b4)
++                L = [len(pools[b].seqs) for b in bins]
++                if min(L) == 0:
++                    continue
++                key = f"{route.name}|{pi}|{si}"
++                got = st.get(key, [str(b) for b in bins])
++                o = [got[str(b)] for b in bins]
++                tri = (b1 == b2, b3 == b4)
++                blocks = [
++                    ((o[0], L[0]), (0, L[1]), (0, L[2]), (0, L[3])),
++                    ((0, o[0]), (o[1], L[1]), (0, L[2]), (0, L[3])),
++                    ((0, o[0]), (0, o[1]), (o[2], L[2]), (0, L[3])),
++                    ((0, o[0]), (0, o[1]), (0, o[2]), (o[3], L[3]))]
++                pend_build = pend_probe = cur_ops = 0
++                eff = max(1, min(4000, a.max_pairs // max(L[1], 1)))
++                for (al, ah), (bl, bh), (cl, ch), (dl, dh) in blocks:
++                    if al >= ah or bl >= bh or cl >= ch or dl >= dh:
++                        continue
++                    bp = (ah - al) * (bh - bl)
++                    pp = (ch - cl) * (dh - dl)
++                    chunks = -(-(ah - al) // eff)
++                    pend_build += bp
++                    pend_probe += pp
++                    cur_ops += bp + chunks * pp
++                total_quads = L[0] * L[1] * L[2] * L[3]
++                covered = o[0] * o[1] * o[2] * o[3]
++                cb, cp = _compatible_pair_ops(route, pools, bins)
++                part_ops = min(cb, pend_build) + min(cp, pend_probe) \
++                    if pend_build else 0
++                changed = [f"{bins[x]}:{o[x]}->{L[x]}"
++                           for x in range(4) if L[x] > o[x]]
++                if pend_build == 0:
++                    reason = ("fully covered -- unchanged/capped key, "
++                              "correctly NOT rematched")
++                elif max(o) == 0:
++                    reason = "BASELINE never completed for this key"
++                else:
++                    reason = f"growth since watermark: {changed}"
++                tot_cur += cur_ops
++                tot_part += part_ops
++                print(f"key {key} bins={bins} sizes={L} marks={o} "
++                      f"tri={tri}")
++                print(f"    quads covered {100*covered/max(total_quads,1):.1f}%"
++                      f"; pending build {pend_build:,} + probe "
++                      f"{pend_probe:,} pair-ops")
++                print(f"    CURRENT engine true ops (chunk x reprobe): "
++                      f"{cur_ops:,}")
++                print(f"    partition-compatible ops (coord-0 exact "
++                      f"condition): {part_ops:,}")
++                print(f"    reason: {reason}")
++        rate = 14e6
++        print(f"worker {wid} TOTALS: current engine {tot_cur:,} ops "
++              f"(~{tot_cur/rate/3600:.1f} h at 14M/s); partitioned "
++              f"{tot_part:,} ops (~{tot_part/rate/3600:.2f} h)")
++
++
+ def verify(a):
+     H = np.loadtxt(a.csv, delimiter=",", dtype=np.int64)
+     N = core.verify_hadamard(H)
+@@ -1718,6 +1858,9 @@
+     pwl.add_argument("--interval", type=float, default=600)
+     pwl.add_argument("--cycles", type=int, default=200)
+     pwl.add_argument("--max-ticks", type=int, default=0)
++    pma = sub.add_parser("match-audit")
++    pma.add_argument("--workdir", default="work")
++    pma.add_argument("--max-pairs", type=int, default=20_000_000)
+     pv = sub.add_parser("verify")
+     pv.add_argument("csv")
+     a = ap.parse_args()
+@@ -1736,7 +1879,8 @@
+      "pause-safe": pause_safe, "resume-safe": resume_safe,
+      "status-safe": status_safe,
+      "refresh-leaderboard": refresh_leaderboard,
+-     "watch-leaderboard": watch_leaderboard}[a.cmd](a)
++     "watch-leaderboard": watch_leaderboard,
++     "match-audit": match_audit}[a.cmd](a)
+ 
+ 
+ if __name__ == "__main__":
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before12/engine.py h668_hardened/engine.py
+--- h668_before12/engine.py	2026-07-12 03:01:33.779345597 +0000
++++ h668_hardened/engine.py	2026-07-12 11:56:47.961678164 +0000
+@@ -193,6 +193,11 @@
+         stats = defaultdict(int)
+     h = pafA.shape[1]
+     lib = load_fastmatch()
++    if os.environ.get("H668_PARTITION", "1") != "0" \
++            and min(len(pafA), len(pafB), len(pafC), len(pafD)) > 0:
++        return _match_partitioned(
++            pafA, pafB, pafC, pafD, wt1, wt2, max_pairs, stats,
++            psd1, psd2, on_progress, collision_log, offs, tri, lib)
+     eff = max(1, min(chunk, max_pairs // max(len(pafB), 1)))
+     psdA_all = psd1[0] if psd1 else None
+     for lo in range(0, len(pafA), eff):
+@@ -340,3 +345,217 @@
+             for (i, j) in table.get(v.astype(np.int16).tobytes(), ()):
+                 out.add((i, j, k, l))
+     return out
++
++
++def _groups_by_coord(paf):
++    """value -> int64 index array, grouped on PAF coordinate 0."""
++    v = paf[:, 0].astype(np.int64)
++    order = np.argsort(v, kind="stable")
++    sv = v[order]
++    cuts = np.flatnonzero(np.diff(sv)) + 1
++    out = {}
++    for chunk_idx in np.split(order, cuts):
++        out[int(v[chunk_idx[0]])] = chunk_idx.astype(np.int64)
++    return out
++
++
++def _match_partitioned(pafA, pafB, pafC, pafD, wt1, wt2, max_pairs,
++                       stats, psd1, psd2, on_progress, collision_log,
++                       offs, tri, lib):
++    """Partition the pair space by the exact necessary condition
++    wt1*(a0+b0) + wt2*(c0+d0) = 0 (coordinate 0 of the combined PAF sum
++    must vanish, because the FULL vector must vanish for a match). Every
++    possibly-matching quadruple has its build pair and probe pair in the
++    same partition, so per-partition matching with one shared table is
++    complete -- and the chunk x full-reprobe multiplication of the legacy
++    path disappears. Oversized partitions are fragmented on the build
++    side only (reprobe confined to that partition). See tests_matchaudit.
++    """
++    h = pafA.shape[1]
++    gA, gB = _groups_by_coord(pafA), _groups_by_coord(pafB)
++    gC, gD = _groups_by_coord(pafC), _groups_by_coord(pafD)
++    psdA, psdB, cap1 = psd1 if psd1 else (None, None, 0.0)
++    psdC, psdD, cap2 = psd2 if psd2 else (None, None, 0.0)
++    if psd1:
++        wA, wB = top_freqs(psdA), top_freqs(psdB)
++        F, K = psdA.shape[1], wA.shape[1]
++    else:
++        wA = wB = None
++        F, K = (psd2[0].shape[1], top_freqs(psd2[0]).shape[1]) \
++            if psd2 else (0, 0)
++    if psd2:
++        wC, wD = top_freqs(psdC), top_freqs(psdD)
++        F, K = psdC.shape[1], wC.shape[1]
++    else:
++        wC = wD = None
++    parts = []
++    for t1 in sorted({a + b for a in gA for b in gB}):
++        num = -wt1 * t1
++        if num % wt2:
++            continue
++        t2 = num // wt2
++        bsegs = [(gA[a], gB[t1 - a]) for a in gA if (t1 - a) in gB]
++        psegs = [(gC[c], gD[t2 - c]) for c in gC if (t2 - c) in gD]
++        if bsegs and psegs:
++            parts.append((bsegs, psegs))
++    done_rows = 0
++    total_rows = sum(len(x) for p in parts for x, _ in p[0]) or 1
++    for bsegs, psegs in parts:
++        if on_progress is not None and \
++                on_progress(done_rows, total_rows) is False:
++            stats["interrupted"] += 1
++            return None
++        pairs = sum(len(x) * len(y) for x, y in bsegs)
++        frags = [bsegs]
++        if pairs > max_pairs:
++            frags = []
++            cur, cur_pairs = [], 0
++            for x, y in bsegs:
++                step = max(1, max_pairs // max(len(y), 1))
++                for lo in range(0, len(x), step):
++                    seg = (x[lo:lo + step], y)
++                    segp = len(seg[0]) * len(y)
++                    if cur_pairs + segp > max_pairs and cur:
++                        frags.append(cur)
++                        cur, cur_pairs = [], 0
++                    cur.append(seg)
++                    cur_pairs += segp
++            if cur:
++                frags.append(cur)
++        for fsegs in frags:
++            r = _run_partition(lib, pafA, pafB, pafC, pafD, h, wt1, wt2,
++                               psdA, wA, psdB, wB, psdC, wC, psdD, wD,
++                               F, K, cap1, cap2, fsegs, psegs, offs,
++                               tri, stats, collision_log)
++            if r is not None:
++                return r
++        done_rows += sum(len(x) for x, _ in bsegs)
++    if on_progress is not None:
++        on_progress(total_rows, total_rows)
++    return None
++
++
++def _run_partition(lib, pafA, pafB, pafC, pafD, h, wt1, wt2,
++                   psdA, wA, psdB, wB, psdC, wC, psdD, wD, F, K,
++                   cap1, cap2, bsegs, psegs, offs, tri, stats,
++                   collision_log):
++    if lib is not None and hasattr(lib, "match_pairs_v7"):
++        return _cc_partition(lib, pafA, pafB, pafC, pafD, h, wt1, wt2,
++                             psdA, wA, psdB, wB, psdC, wC, psdD, wD,
++                             F, K, cap1, cap2, bsegs, psegs, offs, tri,
++                             stats, collision_log)
++    # python reference: dict table over build segments, probe segments
++    table = {}
++    a_off, b_off, c_off, d_off = offs
++    for xi, yj in bsegs:
++        for i in xi:
++            row = wt1 * (pafA[i].astype(np.int32) + pafB[yj])
++            for pos, j in enumerate(yj):
++                if tri[0] and (a_off + i) > (b_off + j):
++                    stats["swap_skipped"] += 1
++                    continue
++                if psdA is not None and _pair_reject(
++                        psdA, psdB, wA, wB, i, j, cap1):
++                    stats["psd_skipped"] += 1
++                    continue
++                table.setdefault(
++                    row[pos].astype(np.int16).tobytes(), []).append(
++                    (int(i), int(j)))
++                stats["pairs_hashed"] += 1
++    stats["buckets"] += stats["pairs_hashed"] * 0 + len(table)
++    for xk, yl in psegs:
++        for k in xk:
++            row = -wt2 * (pafC[k].astype(np.int32) + pafD[yl])
++            keys = row.astype(np.int16)
++            for pos, l in enumerate(yl):
++                if tri[1] and (c_off + k) > (d_off + l):
++                    stats["swap_skipped"] += 1
++                    continue
++                if psdC is not None and _pair_reject(
++                        psdC, psdD, wC, wD, k, l, cap2):
++                    stats["psd_skipped"] += 1
++                    continue
++                stats["probes"] += 1
++                hits = table.get(keys[pos].tobytes())
++                if hits:
++                    stats["collisions"] += len(hits)
++                    i, j = hits[0]
++                    if collision_log is not None:
++                        collision_log.append((i, j, int(k), int(l)))
++                    return (i, j, int(k), int(l))
++    return None
++
++
++def _pair_reject(psdX, psdY, wX, wY, i, j, cap):
++    for t in range(wX.shape[1]):
++        w = int(wX[i, t])
++        if psdX[i, w] + psdY[j, w] > cap + 1e-6:
++            return True
++    for t in range(wY.shape[1]):
++        w = int(wY[j, t])
++        if psdX[i, w] + psdY[j, w] > cap + 1e-6:
++            return True
++    return False
++
++
++def _cc_partition(lib, pafA, pafB, pafC, pafD, h, wt1, wt2,
++                  psdA, wA, psdB, wB, psdC, wC, psdD, wD, F, K,
++                  cap1, cap2, bsegs, psegs, offs, tri, stats,
++                  collision_log):
++    def P16(x):
++        return np.ascontiguousarray(x, np.int16).ctypes.data_as(
++            ctypes.POINTER(ctypes.c_int16))
++
++    def PF(x):
++        return (np.ascontiguousarray(x, np.float32).ctypes.data_as(
++            ctypes.POINTER(ctypes.c_float)) if x is not None
++            else ctypes.POINTER(ctypes.c_float)())
++
++    def PI(x):
++        return (np.ascontiguousarray(x, np.int32).ctypes.data_as(
++            ctypes.POINTER(ctypes.c_int32)) if x is not None
++            else ctypes.POINTER(ctypes.c_int32)())
++
++    def PL(x):
++        return np.ascontiguousarray(x, np.int64).ctypes.data_as(
++            ctypes.POINTER(ctypes.c_longlong))
++
++    def flat(segs, side):
++        idx = np.concatenate([s[side] for s in segs]) if segs else \
++            np.empty(0, np.int64)
++        starts = np.zeros(len(segs) + 1, np.int64)
++        for i, s in enumerate(segs):
++            starts[i + 1] = starts[i] + len(s[side])
++        return idx.astype(np.int64), starts
++
++    biA, bsA = flat(bsegs, 0)
++    biB, bsB = flat(bsegs, 1)
++    piC, psC = flat(psegs, 0)
++    piD, psD = flat(psegs, 1)
++    table_pairs = sum(len(x) * len(y) for x, y in bsegs)
++    out = (ctypes.c_longlong * 4)()
++    st = (ctypes.c_longlong * 7)()
++    coll_buf = (ctypes.c_longlong * (64 * 4))()
++    coll_n = ctypes.c_longlong(0)
++    found = lib.match_pairs_v7(
++        P16(pafA), P16(pafB), P16(pafC), P16(pafD), h, wt1, wt2,
++        PF(psdA), PI(wA), PF(psdB), PI(wB),
++        PF(psdC), PI(wC), PF(psdD), PI(wD),
++        F, K, cap1, cap2,
++        PL(biA), PL(biB), PL(bsA), PL(bsB), len(bsegs),
++        PL(piC), PL(piD), PL(psC), PL(psD), len(psegs),
++        offs[0], offs[1], offs[2], offs[3],
++        1 if tri[0] else 0, 1 if tri[1] else 0, max(table_pairs, 1),
++        out, st, coll_buf, 64, ctypes.byref(coll_n))
++    for key, x in zip(("pairs_hashed", "buckets", "probes",
++                       "collisions", "psd_skipped"), range(5)):
++        stats[key] += st[x]
++    stats["swap_skipped"] += st[5] + st[6]
++    if collision_log is not None:
++        for x in range(coll_n.value):
++            collision_log.append((coll_buf[4 * x], coll_buf[4 * x + 1],
++                                  coll_buf[4 * x + 2],
++                                  coll_buf[4 * x + 3]))
++    if found:
++        return tuple(int(v) for v in out)
++    return None
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before12/fastmatch.cpp h668_hardened/fastmatch.cpp
+--- h668_before12/fastmatch.cpp	2026-07-12 03:01:33.779970054 +0000
++++ h668_hardened/fastmatch.cpp	2026-07-12 11:55:47.425682449 +0000
+@@ -502,3 +502,112 @@
+     }
+     return 0;
+ }
++
++// v7: segmented, index-addressed matching. One hash table is built from
++// nBuildSegs (idxA,idxB) row-index segment products, then probed by
++// nProbeSegs (idxC,idxD) segment products. Rows are addressed through the
++// idx arrays into the SAME base paf/psd arrays, so a partition of the
++// pair space by an exact necessary condition (equal weighted coordinate
++// sums) costs one call per partition with NO reprobe multiplication.
++// Semantics per examined pair are byte-identical to v6: same combine,
++// same hash, same PSD screen, same triangle rule (on idx+off global
++// order), same memcmp verification, same collision capture.
++extern "C" int64_t match_pairs_v7(
++    const int16_t *pafA, const int16_t *pafB,
++    const int16_t *pafC, const int16_t *pafD, int64_t h,
++    int16_t wt1, int16_t wt2,
++    const float *psdA, const int32_t *wA, const float *psdB,
++    const int32_t *wB,
++    const float *psdC, const int32_t *wC, const float *psdD,
++    const int32_t *wD,
++    int64_t F, int64_t K, float cap1, float cap2,
++    const int64_t *bIdxA, const int64_t *bIdxB,
++    const int64_t *bStartA, const int64_t *bStartB, int64_t nBuild,
++    const int64_t *pIdxC, const int64_t *pIdxD,
++    const int64_t *pStartC, const int64_t *pStartD, int64_t nProbe,
++    int64_t offA, int64_t offB, int64_t offC, int64_t offD,
++    int32_t tri1, int32_t tri2, int64_t table_pairs,
++    int64_t *out_idx, int64_t *stats,
++    int64_t *coll_out, int64_t coll_cap, int64_t *coll_n) {
++
++    for (int i = 0; i < 7; i++) stats[i] = 0;
++    *coll_n = 0;
++    if (nBuild == 0 || nProbe == 0) return 0;
++    const bool s1 = psdA && psdB && wA && cap1 > 0 && K > 0;
++    const bool s2 = psdC && psdD && wC && cap2 > 0 && K > 0;
++
++    uint64_t cap = 16;
++    while ((int64_t)cap < 2 * table_pairs) cap <<= 1;
++    std::vector<uint64_t> keys(cap, 0);
++    std::vector<int64_t> ai(cap), bj(cap);
++    std::vector<int16_t> buf(h);
++
++    for (int64_t s = 0; s < nBuild; s++) {
++        for (int64_t x = bStartA[s]; x < bStartA[s + 1]; x++) {
++            const int64_t i = bIdxA[x];
++            const int16_t *ra = pafA + i * h;
++            for (int64_t y = bStartB[s]; y < bStartB[s + 1]; y++) {
++                const int64_t j = bIdxB[y];
++                if (tri1 && (offA + i) > (offB + j)) {
++                    stats[5]++; continue;
++                }
++                if (s1 && psd_reject(psdA, psdB, wA, wB, i, j, F, K,
++                                     cap1)) {
++                    stats[4]++; continue;
++                }
++                combine_rows(ra, pafB + j * h, wt1, buf.data(), h);
++                uint64_t k = hash64w(buf.data(), h),
++                         pos = k & (cap - 1);
++                while (keys[pos] != 0) pos = (pos + 1) & (cap - 1);
++                keys[pos] = k; ai[pos] = i; bj[pos] = j;
++                stats[0]++;
++            }
++        }
++    }
++    stats[1] = stats[0];
++
++    std::vector<int16_t> probe(h), chk(h);
++    for (int64_t s = 0; s < nProbe; s++) {
++        for (int64_t x = pStartC[s]; x < pStartC[s + 1]; x++) {
++            const int64_t k2 = pIdxC[x];
++            const int16_t *rc = pafC + k2 * h;
++            for (int64_t y = pStartD[s]; y < pStartD[s + 1]; y++) {
++                const int64_t l = pIdxD[y];
++                if (tri2 && (offC + k2) > (offD + l)) {
++                    stats[6]++; continue;
++                }
++                if (s2 && psd_reject(psdC, psdD, wC, wD, k2, l, F, K,
++                                     cap2)) {
++                    stats[4]++; continue;
++                }
++                combine_rows(rc, pafD + l * h, (int16_t)(-wt2),
++                             probe.data(), h);
++                stats[2]++;
++                uint64_t k = hash64w(probe.data(), h),
++                         pos = k & (cap - 1);
++                while (keys[pos] != 0) {
++                    if (keys[pos] == k) {
++                        stats[3]++;
++                        int64_t i = ai[pos], j = bj[pos];
++                        if (*coll_n < coll_cap) {
++                            int64_t *rec = coll_out + (*coll_n) * 4;
++                            rec[0] = i; rec[1] = j;
++                            rec[2] = k2; rec[3] = l;
++                            (*coll_n)++;
++                        }
++                        combine_rows(pafA + i * h, pafB + j * h, wt1,
++                                     chk.data(), h);
++                        if (std::memcmp(chk.data(), probe.data(),
++                                        h * 2) == 0) {
++                            out_idx[0] = i; out_idx[1] = j;
++                            out_idx[2] = k2; out_idx[3] = l;
++                            return 1;
++                        }
++                    }
++                    pos = (pos + 1) & (cap - 1);
++                }
++            }
++        }
++    }
++    return 0;
++}
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before12/native.py h668_hardened/native.py
+--- h668_before12/native.py	2026-07-12 03:01:33.788324765 +0000
++++ h668_hardened/native.py	2026-07-12 11:56:39.518312505 +0000
+@@ -39,6 +39,24 @@
+         ctypes.c_longlong, ctypes.c_float, ctypes.c_float,
+         ctypes.POINTER(ctypes.c_longlong),
+         ctypes.POINTER(ctypes.c_longlong)]
++    if hasattr(lib, "match_pairs_v7"):
++        P16 = ctypes.POINTER(ctypes.c_int16)
++        PF = ctypes.POINTER(ctypes.c_float)
++        PI = ctypes.POINTER(ctypes.c_int32)
++        PL = ctypes.POINTER(ctypes.c_longlong)
++        lib.match_pairs_v7.restype = ctypes.c_longlong
++        lib.match_pairs_v7.argtypes = (
++            [P16, P16, P16, P16, ctypes.c_longlong,
++             ctypes.c_int16, ctypes.c_int16,
++             PF, PI, PF, PI, PF, PI, PF, PI,
++             ctypes.c_longlong, ctypes.c_longlong,
++             ctypes.c_float, ctypes.c_float,
++             PL, PL, PL, PL, ctypes.c_longlong,
++             PL, PL, PL, PL, ctypes.c_longlong,
++             ctypes.c_longlong, ctypes.c_longlong,
++             ctypes.c_longlong, ctypes.c_longlong,
++             ctypes.c_int32, ctypes.c_int32, ctypes.c_longlong,
++             PL, PL, PL, ctypes.c_longlong, PL])
+     if hasattr(lib, "match_pairs_v6"):
+         lib.match_pairs_v6.restype = ctypes.c_longlong
+         lib.match_pairs_v6.argtypes = (
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before12/tests_canon.py h668_hardened/tests_canon.py
+--- h668_before12/tests_canon.py	2026-07-12 03:01:33.794834484 +0000
++++ h668_hardened/tests_canon.py	2026-07-12 11:58:30.405100541 +0000
+@@ -68,6 +68,7 @@
+       "matching identity is symmetric in each side's pair", rep_ok)
+ 
+ # ---- 1. tri restriction: same solvability as exhaustive, verified H ----
++os.environ["H668_PARTITION"] = "0"   # exact v6 counters under test
+ s_tri = defaultdict(int)
+ hit = engine.match(A, B, C, D, max_pairs=10**9, stats=s_tri,
+                    offs=(0, 0, 0, 0), tri=(True, True))
+@@ -104,6 +105,7 @@
+       "i<=j pairs as one unblocked pass (no pair lost, none doubled)",
+       s_blk["pairs_hashed"] == s_full["pairs_hashed"]
+       == nrows * (nrows + 1) // 2)
++os.environ.pop("H668_PARTITION", None)   # back to default (partitioned)
+ 
+ # ---- 3. python/native parity with tri + PSD screens together ----
+ seqs = rng.choice(np.array([-1, 1], np.int8), (60, 13))
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before12/tests_matchaudit.py h668_hardened/tests_matchaudit.py
+--- h668_before12/tests_matchaudit.py	1970-01-01 00:00:00.000000000 +0000
++++ h668_hardened/tests_matchaudit.py	2026-07-12 12:00:04.066170143 +0000
+@@ -0,0 +1,259 @@
++"""match-audit + partitioned matching (v7) proof tests."""
++import json
++import os
++import shutil
++import subprocess
++import sys
++import time
++from collections import defaultdict
++
++import numpy as np
++
++os.environ.pop("H668_PARTITION", None)
++import core
++import engine
++import worker as wk
++
++rng = np.random.default_rng(91)
++PASS = 0
++PY = sys.executable
++WD = "ma_work"
++
++
++def check(name, cond):
++    global PASS
++    if not cond:
++        print(f"FAIL  {name}")
++        sys.exit(1)
++    PASS += 1
++    print(f"ok    {name}")
++
++
++def ctl(args):
++    return subprocess.run([PY, "ctl.py"] + args, capture_output=True,
++                          text=True, timeout=400)
++
++
++# ---- 1. partition soundness proof: every exhaustive solution's build
++#         and probe pairs share compatible coordinate-0 partitions -------------
++route = wk.GSRoute(13)
++pools = {s: engine.Pool(13, True) for s in route.bins}
++for s in route.bins:
++    for _ in range(60):
++        if len(pools[s].seqs) >= 90:
++            break
++        pools[s].add(route.generate(s, 20000, rng),
++                     need=90 - len(pools[s].seqs))
++proved = 0
++for pat in route.patterns:
++    for (b1, b2), (b3, b4) in route.splits(pat):
++        pf = lambda b: core.paf_half_batch(pools[b].seqs)
++        A, B, C, D = (pf(b) for b in (b1, b2, b3, b4))
++        for (i, j, k, l) in engine.find_all_matches(A, B, C, D):
++            t1 = int(A[i, 0]) + int(B[j, 0])
++            t2 = int(C[k, 0]) + int(D[l, 0])
++            assert t1 + t2 == 0, "partition condition violated"
++            proved += 1
++check(f"PARTITION PROOF: all {proved} exhaustive solutions satisfy "
++      f"wt1*(a0+b0)+wt2*(c0+d0)=0, so coordinate-0 partitioning can "
++      f"never separate a match", proved > 0)
++
++# ---- 2. equivalence: partitioned vs exhaustive, randomized + weights ----------
++agree = True
++for t in range(10):
++    hh = int(rng.integers(2, 40))
++    mats = [rng.integers(-25, 25, (int(rng.integers(3, 45)), hh)
++                         ).astype(np.int16) for _ in range(4)]
++    w1, w2 = 1 + t % 2, 1 + t % 3
++    ref = engine.find_all_matches(*mats, wt1=w1, wt2=w2)
++    got = engine.match(*mats, wt1=w1, wt2=w2, max_pairs=10**9)
++    if (got is None) != (len(ref) == 0) or (got and got not in ref):
++        agree = False
++check("partitioned match finds a solution iff the exhaustive reference "
++      "does (10 randomized trials incl. weights)", agree)
++
++# with PSD screens + tri, on the same-bin GS split
++pat, ((b1, b2), (b3, b4)) = next(
++    (p, s) for p in route.patterns for s in route.splits(p)
++    if s[0][0] == s[0][1] and s[1][0] == s[1][1])
++pf = lambda b: core.paf_half_batch(pools[b].seqs)
++A, B, C, D = (pf(b) for b in (b1, b2, b3, b4))
++psd = {b: engine.psd_rows_periodic(pools[b].seqs)
++       for b in (b1, b2, b3, b4)}
++s7 = defaultdict(int)
++hit = engine.match(A, B, C, D, max_pairs=10**9, stats=s7,
++                   psd1=(psd[b1], psd[b2], 52.0),
++                   psd2=(psd[b3], psd[b4], 52.0),
++                   offs=(0, 0, 0, 0), tri=(True, True))
++ref = engine.find_all_matches(A, B, C, D)
++check("same-bin tri STILL ACTIVE under partitioned path (swap pairs "
++      "skipped, solution from exhaustive set, verifies)",
++      s7["swap_skipped"] > 0 and hit is not None and hit in ref
++      and core.verify_hadamard(core.gs_build(
++          [pools[b].seqs[x] for b, x in
++           zip((b1, b2, b3, b4), hit)])) == 52)
++
++# ---- 3. python/native v7 parity on all counters -------------------------------
++outs = {}
++for mode in ("1", "0"):
++    os.environ["H668_NATIVE"] = mode
++    engine._LIB = None
++    import native
++    native._STATE.update(lib=None, checked=False, enabled=False,
++                         backend="python", fallback_reason=None)
++    st = defaultdict(int)
++    r = engine.match(A, B, C, D, max_pairs=250, stats=st,
++                     psd1=(psd[b1], psd[b2], 52.0),
++                     psd2=(psd[b3], psd[b4], 52.0),
++                     offs=(0, 0, 0, 0), tri=(True, True))
++    outs[mode] = (r, dict(st))
++os.environ.pop("H668_NATIVE")
++engine._LIB = None
++check("python and native v7 agree on pairs, probes, psd_skipped, "
++      "swap_skipped, and outcome (incl. oversized-partition "
++      "fragmentation at max_pairs=250)",
++      all(outs["0"][1].get(k, 0) == outs["1"][1].get(k, 0)
++          for k in ("pairs_hashed", "probes", "psd_skipped",
++                    "swap_skipped"))
++      and (outs["0"][0] is None) == (outs["1"][0] is None))
++
++# ---- 4. the speedup is real: probe multiplication eliminated ------------------
++L = 1500
++paf = rng.integers(-30, 30, (L, 40)).astype(np.int16)
++res = {}
++for mode in ("1", "0"):
++    os.environ["H668_PARTITION"] = mode
++    s = defaultdict(int)
++    t0 = time.perf_counter()
++    engine.match(paf, paf, paf, paf, max_pairs=100_000, stats=s)
++    res[mode] = (dict(s), time.perf_counter() - t0)
++os.environ.pop("H668_PARTITION")
++check(f"probe count drops from {res['0'][0]['probes']:,} (legacy "
++      f"chunked) to {res['1'][0]['probes']:,} (partitioned); wall "
++      f"{res['0'][1]:.2f}s -> {res['1'][1]:.2f}s "
++      f"({res['0'][1]/max(res['1'][1],1e-9):.1f}x)",
++      res["1"][0]["probes"] * 5 < res["0"][0]["probes"]
++      and res["0"][1] > res["1"][1] * 5)
++
++# ---- 5. incremental growth: staged watermark blocks stay complete ------------
++tiny = {b: engine.Pool(13, True) for b in route.bins}
++for b in route.bins:
++    tiny[b].seqs = pools[b].seqs[:20].copy()
++if os.path.exists("ma_state.json"):
++    os.remove("ma_state.json")
++st1 = wk.MatchState("ma_state.json")
++r1 = wk.incremental_match(route, tiny, st1, 500_000, 400,
++                          defaultdict(int), caches={})
++for b in route.bins:   # grow every bin, run incrementally again
++    tiny[b].seqs = pools[b].seqs[: len(pools[b].seqs)].copy()
++st2 = wk.MatchState("ma_state.json")
++st2.load(tiny, wk.bin_key)
++r2 = wk.incremental_match(route, tiny, st2, 500_000, 400,
++                          defaultdict(int), caches={})
++exists = any(engine.find_all_matches(
++    *[core.paf_half_batch(tiny[b].seqs) for b in
++      (bb1, bb2, bb3, bb4)])
++    for p in route.patterns
++    for (bb1, bb2), (bb3, bb4) in route.splits(p))
++found = (r1 is not None) or (r2 is not None)
++check("staged growth under partitioned matching: solution found iff one "
++      "exists across incremental cycles (watermark blocks complete)",
++      found == exists)
++if os.path.exists("ma_state.json"):
++    os.remove("ma_state.json")
++
++# ---- 6. end-to-end: GS and TT workers solve + verify under partition ----------
++shutil.rmtree(WD, ignore_errors=True)
++os.makedirs(WD)
++for widx, (routearg, narg, order) in enumerate(
++        (("gs", "13", 52), ("tt", "4", 44))):
++    subprocess.run([PY, "worker.py", "--route", routearg, "--n", narg,
++                    "--worker-id", str(widx), "--workdir", WD,
++                    "--pool-cap",
++                    "300", "--batch", "20000", "--max-pairs", "500000"],
++                   capture_output=True, text=True, timeout=300)
++    H = np.loadtxt(f"hadamard_{order}.csv", delimiter=",",
++                   dtype=np.int64)
++    check(f"end-to-end {routearg} worker solves and verifies order "
++          f"{order} under the partitioned engine",
++          core.verify_hadamard(H) == order)
++    os.remove(os.path.join(WD, "SOLUTION.json"))
++    os.remove(os.path.join(WD, "STOP"))
++
++# ---- 7. match-audit command fields + watermark invariants ----------------------
++# purpose-built audited worker: matchless pools, state completed in-process
++d0 = os.path.join(WD, "worker_002")
++os.makedirs(d0, exist_ok=True)
++json.dump({"worker_id": 2, "route": "gs", "n": 13},
++          open(os.path.join(d0, "meta.json"), "w"))
++aud = {b: engine.Pool(13, True) for b in route.bins}
++k = 3
++while True:
++    for b in route.bins:
++        aud[b].seqs = pools[b].seqs[:k].copy()
++    if not any(engine.find_all_matches(
++            *[core.paf_half_batch(aud[bb].seqs) for bb in
++              (x1, x2, x3, x4)])
++            for p in route.patterns
++            for (x1, x2), (x3, x4) in route.splits(p)) or k == 1:
++        break
++    k -= 1
++sta = wk.MatchState(os.path.join(d0, "matchstate.json"))
++assert wk.incremental_match(route, aud, sta, 500_000, 400,
++                            defaultdict(int), caches={}) is None
++np.savez_compressed(os.path.join(d0, "pools.npz"),
++                    **{wk.bin_key(b): aud[b].seqs for b in aud})
++r = ctl(["match-audit", "--workdir", WD])
++out = r.stdout
++check("match-audit prints route, key, bins, sizes, marks, tri, coverage, "
++      "pending, true chunked ops, partitioned ops, reason",
++      all(x in out for x in ("route=gs", "key gs|", "bins=", "sizes=",
++                             "marks=", "tri=", "quads covered",
++                             "CURRENT engine true ops",
++                             "partition-compatible ops", "reason:",
++                             "opt_version OK", "fingerprints valid")))
++check("match-audit flags fully-covered keys as correctly not rematched",
++      "correctly NOT rematched" in out)
++# unchanged pools: audit twice -> marks persist (still valid)
++r2 = ctl(["match-audit", "--workdir", WD])
++check("watermarks persist across unchanged pools (repeat audit: still "
++      "valid, still fully covered)",
++      "fingerprints valid" in r2.stdout
++      and "correctly NOT rematched" in r2.stdout)
++# pool mutation invalidates
++pz = np.load(os.path.join(d0, "pools.npz"))
++arrays = {k: pz[k].copy() for k in pz.files}
++kbig = max(arrays, key=lambda k: len(arrays[k]))
++arrays[kbig][0, 0] *= -1   # mutate a prefix row
++np.savez_compressed(os.path.join(d0, "pools.npz"), **arrays)
++r3 = ctl(["match-audit", "--workdir", WD])
++check("prefix mutation invalidates watermarks (audit reports DISCARDED "
++      "+ baseline pending)",
++      "DISCARDED" in r3.stdout and "BASELINE" in r3.stdout)
++arrays[kbig][0, 0] *= -1
++np.savez_compressed(os.path.join(d0, "pools.npz"), **arrays)
++# OPT_VERSION mismatch invalidates
++sp = os.path.join(d0, "matchstate.json")
++raw = json.load(open(sp))
++raw["opt_version"] = -1
++json.dump(raw, open(sp, "w"))
++r4 = ctl(["match-audit", "--workdir", WD])
++check("OPT_VERSION mismatch invalidates watermarks (audit reports "
++      "MISMATCH -> discard)", "MISMATCH -> discard" in r4.stdout)
++
++# ---- 8. worker 004 protection unchanged ----------------------------------------
++os.makedirs(os.path.join(WD, "worker_004"), exist_ok=True)
++json.dump({"worker_id": 4, "route": "gs", "seed": 94091007},
++          open(os.path.join(WD, "worker_004", "meta.json"), "w"))
++open(os.path.join(WD, "worker_004", "PIN"), "w").write("clue owner\n")
++r5 = ctl(["rotate-gs-seeds", "--workdir", WD, "--seeds", "1",
++          "--replace-workers", "4"])
++check("worker 004 remains GS and pinned; rotation still refused",
++      r5.returncode != 0 and "PINNED" in (r5.stdout + r5.stderr))
++
++shutil.rmtree(WD, ignore_errors=True)
++for f in ("hadamard_52.csv", "hadamard_44.csv",
++          "hadamard_52_collision.csv", "hadamard_44_collision.csv"):
++    if os.path.exists(f):
++        os.remove(f)
++print(f"\nALL {PASS} MATCH-AUDIT/PARTITION TESTS PASSED")

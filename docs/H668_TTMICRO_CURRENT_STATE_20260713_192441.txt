@@ -1,0 +1,354 @@
+=== status-safe ===
+route mix (alive): 0 TT / 0 GS (manifest expects 10 TT / 2 GS)
+worker 004: route=gs pinned=True OK
+dashboard: NOT RESPONDING (URLError)
+auto-rotate: not running
+state: running
+missing workers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+duplicate workers: -
+wrong-route workers: -
+leaderboard: 14 seeds, refreshed 25 min ago; top seed 94054003 (score 42)
+
+=== live workers ===
+
+=== progress and matchstate ===
+worker_000 route= gs seed= 94054006 phase= matching key 28/30 block 3/4 progress_age_min= 15.7 matchstate_size= 2435 matchstate_age_min= 17.0 pairs= 2245348223 probes= 1875109983
+worker_001 route= tt seed= 94041004 phase= matching key 2/12 block 1/4 progress_age_min= 389.0 matchstate_size= 1306 matchstate_age_min= 829.8 pairs= 4679053285 probes= 81169259
+worker_002 route= tt seed= 94076005 phase= matching key 1/12 block 1/4 progress_age_min= 50.3 matchstate_size= 42 matchstate_age_min= 2711.3 pairs= 4690892095 probes= 82611048
+worker_003 route= tt seed= 94067009 phase= matching key 1/12 block 1/4 progress_age_min= 167.2 matchstate_size= 42 matchstate_age_min= 2711.3 pairs= 4656479660 probes= 81631419
+worker_004 route= gs seed= 94091007 phase= matching key 26/30 block 4/4 progress_age_min= 16.0 matchstate_size= 2435 matchstate_age_min= 20.5 pairs= 6908574393 probes= 8861946396
+worker_005 route= tt seed= 94025008 phase= matching key 1/12 block 1/4 progress_age_min= 136.4 matchstate_size= 42 matchstate_age_min= 2711.3 pairs= 4657653870 probes= 81538224
+worker_006 route= tt seed= 94025003 phase= matching key 2/12 block 1/4 progress_age_min= 160.6 matchstate_size= 1306 matchstate_age_min= 746.8 pairs= 4634085189 probes= 81300930
+worker_007 route= tt seed= 94091011 phase= matching key 2/12 block 1/4 progress_age_min= 73.9 matchstate_size= 1306 matchstate_age_min= 368.3 pairs= 4719344362 probes= 82650343
+worker_008 route= tt seed= 94054007 phase= matching key 2/12 block 1/4 progress_age_min= 112.0 matchstate_size= 1306 matchstate_age_min= 172.2 pairs= 4641751628 probes= 81556646
+worker_009 route= tt seed= 94021003 phase= matching key 2/12 block 1/4 progress_age_min= 79.3 matchstate_size= 1306 matchstate_age_min= 370.1 pairs= 4692455597 probes= 82449642
+worker_010 route= tt seed= 94076003 phase= matching key 1/12 block 1/4 progress_age_min= 175.4 matchstate_size= 42 matchstate_age_min= 2711.4 pairs= 4645349627 probes= 81741303
+worker_011 route= tt seed= 94076006 phase= matching key 1/12 block 1/4 progress_age_min= 524.4 matchstate_size= 42 matchstate_age_min= 2711.3 pairs= 4710206021 probes= 82918129
+
+=== match-audit micro baseline ===
+
+=== worker 0 route=gs n=167 ===
+matchstate: opt_version OK (3 vs 3); fingerprints valid; last update 2026-07-13 19:07:39
+key gs|0|0 bins=(15, 15, 13, 7) sizes=[49789, 49789, 47951, 44008] marks=[49789, 49789, 47951, 44008] tri=(True, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|0|1 bins=(15, 13, 15, 7) sizes=[49789, 47951, 49789, 44008] marks=[49789, 47951, 49789, 44008] tri=(False, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|0|2 bins=(15, 7, 15, 13) sizes=[49789, 44008, 49789, 47951] marks=[49789, 44008, 49789, 47951] tri=(False, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|1|0 bins=(17, 17, 9, 3) sizes=[52003, 52003, 44834, 42831] marks=[52003, 52003, 44834, 42831] tri=(True, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|1|1 bins=(17, 9, 17, 3) sizes=[52003, 44834, 52003, 42831] marks=[52003, 44834, 52003, 42831] tri=(False, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|1|2 bins=(17, 3, 17, 9) sizes=[52003, 42831, 52003, 44834] marks=[52003, 42831, 52003, 44834] tri=(False, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|2|0 bins=(19, 15, 9, 1) sizes=[54522, 49789, 44834, 42524] marks=[54522, 49789, 44834, 42524] tri=(False, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|2|1 bins=(19, 9, 15, 1) sizes=[54522, 44834, 49789, 42524] marks=[54522, 44834, 49789, 42524] tri=(False, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|2|2 bins=(19, 1, 15, 9) sizes=[54522, 42524, 49789, 44834] marks=[54522, 42524, 49789, 44834] tri=(False, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|3|0 bins=(19, 17, 3, 3) sizes=[54522, 52003, 42831, 42831] marks=[54522, 52003, 42831, 42831] tri=(False, True)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|3|1 bins=(19, 3, 17, 3) sizes=[54522, 42831, 52003, 42831] marks=[54522, 42831, 52003, 42831] tri=(False, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|3|2 bins=(19, 3, 17, 3) sizes=[54522, 42831, 52003, 42831] marks=[54522, 42831, 52003, 42831] tri=(False, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|4|0 bins=(21, 11, 9, 5) sizes=[57936, 46210, 44834, 43541] marks=[57936, 46210, 44834, 43541] tri=(False, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|4|1 bins=(21, 9, 11, 5) sizes=[57936, 44834, 46210, 43541] marks=[57936, 44834, 46210, 43541] tri=(False, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|4|2 bins=(21, 5, 11, 9) sizes=[57936, 43541, 46210, 44834] marks=[57936, 43541, 46210, 44834] tri=(False, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|5|0 bins=(21, 13, 7, 3) sizes=[57936, 47951, 44008, 42831] marks=[57936, 47951, 44008, 42831] tri=(False, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|5|1 bins=(21, 7, 13, 3) sizes=[57936, 44008, 47951, 42831] marks=[57936, 44008, 47951, 42831] tri=(False, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|5|2 bins=(21, 3, 13, 7) sizes=[57936, 42831, 47951, 44008] marks=[57936, 42831, 47951, 44008] tri=(False, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|6|0 bins=(21, 15, 1, 1) sizes=[57936, 49789, 42524, 42524] marks=[57936, 49789, 42524, 42524] tri=(False, True)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|6|1 bins=(21, 1, 15, 1) sizes=[57936, 42524, 49789, 42524] marks=[57936, 42524, 49789, 42524] tri=(False, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|6|2 bins=(21, 1, 15, 1) sizes=[57936, 42524, 49789, 42524] marks=[57936, 42524, 49789, 42524] tri=(False, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|7|0 bins=(23, 9, 7, 3) sizes=[61489, 44834, 44008, 42831] marks=[61489, 44834, 44008, 42831] tri=(False, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|7|1 bins=(23, 7, 9, 3) sizes=[61489, 44008, 44834, 42831] marks=[61489, 44008, 44834, 42831] tri=(False, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|7|2 bins=(23, 3, 9, 7) sizes=[61489, 42831, 44834, 44008] marks=[61489, 42831, 44834, 44008] tri=(False, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|8|0 bins=(23, 11, 3, 3) sizes=[61489, 46210, 42831, 42831] marks=[61489, 46210, 42831, 42831] tri=(False, True)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|8|1 bins=(23, 3, 11, 3) sizes=[61489, 42831, 46210, 42831] marks=[61489, 42831, 46210, 42831] tri=(False, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|8|2 bins=(23, 3, 11, 3) sizes=[61489, 42831, 46210, 42831] marks=[61489, 42831, 46210, 42831] tri=(False, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key gs|9|0 bins=(25, 5, 3, 3) sizes=[65686, 43541, 42831, 42831] marks=[65330, 43323, 42587, 42587] tri=(False, True)
+    quads covered 97.8%; pending build 5,690,325,716 + probe 3,689,831,114 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 272,837,947,356
+    partition-compatible ops (coord-0 exact condition): 4,694,528,661
+    reason: growth since watermark: ['25:65330->65686', '5:43323->43541', '3:42587->42831', '3:42587->42831']
+key gs|9|1 bins=(25, 3, 5, 3) sizes=[65686, 42831, 43541, 42831] marks=[65330, 42587, 43323, 42587] tri=(False, False)
+    quads covered 97.8%; pending build 5,595,605,776 + probe 3,749,717,112 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 273,219,078,628
+    partition-compatible ops (coord-0 exact condition): 4,678,301,624
+    reason: growth since watermark: ['25:65330->65686', '3:42587->42831', '5:43323->43541', '3:42587->42831']
+key gs|9|2 bins=(25, 3, 5, 3) sizes=[65686, 42831, 43541, 42831] marks=[65330, 42587, 43323, 42587] tri=(False, False)
+    quads covered 97.8%; pending build 5,595,605,776 + probe 3,749,717,112 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 273,219,078,628
+    partition-compatible ops (coord-0 exact condition): 4,678,301,624
+    reason: growth since watermark: ['25:65330->65686', '3:42587->42831', '5:43323->43541', '3:42587->42831']
+worker 0 TOTALS: current engine 819,276,104,612 ops (~16.3 h at 14M/s); partitioned 14,051,131,909 ops (~0.28 h)
+
+=== worker 1 route=tt n=56 ===
+matchstate: opt_version OK (3 vs 3); fingerprints valid; last update 2026-07-13 05:34:55
+key tt|0|0 bins=(('xy', 4), ('xy', 2), ('z', 6), ('w', 11)) sizes=[400000, 400000, 142690, 128887] marks=[400000, 400000, 142690, 128887] tri=(False, False)
+    quads covered 100.0%; pending build 0 + probe 0 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 0
+    partition-compatible ops (coord-0 exact condition): 0
+    reason: fully covered -- unchanged/capped key, correctly NOT rematched
+key tt|1|0 bins=(('xy', 6), ('xy', 0), ('z', 10), ('w', 7)) sizes=[400000, 400000, 181432, 100828] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 18,293,425,696 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 146,507,405,568,000
+    partition-compatible ops (coord-0 exact condition): 98,451,369,681
+    reason: BASELINE never completed for this key
+key tt|2|0 bins=(('xy', 8), ('xy', 6), ('z', 6), ('w', 9)) sizes=[400000, 400000, 142690, 113275] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 16,163,209,750 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 129,465,678,000,000
+    partition-compatible ops (coord-0 exact condition): 96,479,311,461
+    reason: BASELINE never completed for this key
+key tt|3|0 bins=(('xy', 10), ('xy', 0), ('z', 6), ('w', 9)) sizes=[400000, 400000, 142690, 113275] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 16,163,209,750 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 129,465,678,000,000
+    partition-compatible ops (coord-0 exact condition): 96,348,826,538
+    reason: BASELINE never completed for this key
+key tt|4|0 bins=(('xy', 10), ('xy', 4), ('z', 10), ('w', 3)) sizes=[400000, 400000, 181432, 86238] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 15,646,332,816 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 125,330,662,528,000
+    partition-compatible ops (coord-0 exact condition): 95,935,503,583
+    reason: BASELINE never completed for this key
+key tt|5|0 bins=(('xy', 10), ('xy', 8), ('z', 2), ('w', 9)) sizes=[400000, 400000, 125233, 113275] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 14,185,768,075 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 113,646,144,600,000
+    partition-compatible ops (coord-0 exact condition): 94,557,831,306
+    reason: BASELINE never completed for this key
+key tt|6|0 bins=(('xy', 10), ('xy', 8), ('z', 6), ('w', 7)) sizes=[400000, 400000, 142690, 100828] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 14,387,147,320 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 115,257,178,560,000
+    partition-compatible ops (coord-0 exact condition): 94,759,235,770
+    reason: BASELINE never completed for this key
+key tt|7|0 bins=(('xy', 12), ('xy', 10), ('z', 6), ('w', 3)) sizes=[400000, 400000, 142690, 86238] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 12,305,300,220 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 98,602,401,760,000
+    partition-compatible ops (coord-0 exact condition): 92,719,394,254
+    reason: BASELINE never completed for this key
+key tt|8|0 bins=(('xy', 14), ('xy', 4), ('z', 6), ('w', 5)) sizes=[400000, 400000, 142690, 91727] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 13,088,525,630 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 104,868,205,040,000
+    partition-compatible ops (coord-0 exact condition): 93,388,834,309
+    reason: BASELINE never completed for this key
+key tt|9|0 bins=(('xy', 14), ('xy', 8), ('z', 6), ('w', 1)) sizes=[400000, 400000, 142690, 83223] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 11,875,089,870 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 95,160,718,960,000
+    partition-compatible ops (coord-0 exact condition): 92,261,113,951
+    reason: BASELINE never completed for this key
+key tt|10|0 bins=(('xy', 16), ('xy', 2), ('z', 6), ('w', 1)) sizes=[400000, 400000, 142690, 83223] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 11,875,089,870 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 95,160,718,960,000
+    partition-compatible ops (coord-0 exact condition): 92,128,628,325
+    reason: BASELINE never completed for this key
+key tt|11|0 bins=(('xy', 18), ('xy', 0), ('z', 2), ('w', 1)) sizes=[400000, 400000, 125233, 83223] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 10,422,265,959 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 83,538,127,672,000
+    partition-compatible ops (coord-0 exact condition): 90,613,480,644
+    reason: BASELINE never completed for this key
+worker 1 TOTALS: current engine 1,237,002,919,648,000 ops (~24543.7 h at 14M/s); partitioned 1,037,643,529,822 ops (~20.59 h)
+
+=== worker 2 route=tt n=56 ===
+matchstate: opt_version OK (3 vs 3); fingerprints DISCARDED (fingerprint/opt mismatch); last update 2026-07-11 22:13:23
+key tt|0|0 bins=(('xy', 4), ('xy', 2), ('z', 6), ('w', 11)) sizes=[400000, 400000, 142690, 128887] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 18,390,886,030 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 147,287,088,240,000
+    partition-compatible ops (coord-0 exact condition): 98,567,732,834
+    reason: BASELINE never completed for this key
+key tt|1|0 bins=(('xy', 6), ('xy', 0), ('z', 10), ('w', 7)) sizes=[400000, 400000, 181432, 100828] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 18,293,425,696 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 146,507,405,568,000
+    partition-compatible ops (coord-0 exact condition): 98,443,358,734
+    reason: BASELINE never completed for this key
+key tt|2|0 bins=(('xy', 8), ('xy', 6), ('z', 6), ('w', 9)) sizes=[400000, 400000, 142690, 113275] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 16,163,209,750 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 129,465,678,000,000
+    partition-compatible ops (coord-0 exact condition): 96,473,003,123
+    reason: BASELINE never completed for this key
+key tt|3|0 bins=(('xy', 10), ('xy', 0), ('z', 6), ('w', 9)) sizes=[400000, 400000, 142690, 113275] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 16,163,209,750 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 129,465,678,000,000
+    partition-compatible ops (coord-0 exact condition): 96,339,197,198
+    reason: BASELINE never completed for this key
+key tt|4|0 bins=(('xy', 10), ('xy', 4), ('z', 10), ('w', 3)) sizes=[400000, 400000, 181432, 86238] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 15,646,332,816 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 125,330,662,528,000
+    partition-compatible ops (coord-0 exact condition): 95,929,986,762
+    reason: BASELINE never completed for this key
+key tt|5|0 bins=(('xy', 10), ('xy', 8), ('z', 2), ('w', 9)) sizes=[400000, 400000, 125233, 113275] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 14,185,768,075 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 113,646,144,600,000
+    partition-compatible ops (coord-0 exact condition): 94,550,206,326
+    reason: BASELINE never completed for this key
+key tt|6|0 bins=(('xy', 10), ('xy', 8), ('z', 6), ('w', 7)) sizes=[400000, 400000, 142690, 100828] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 14,387,147,320 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 115,257,178,560,000
+    partition-compatible ops (coord-0 exact condition): 94,751,610,790
+    reason: BASELINE never completed for this key
+key tt|7|0 bins=(('xy', 12), ('xy', 10), ('z', 6), ('w', 3)) sizes=[400000, 400000, 142690, 86238] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 12,305,300,220 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 98,602,401,760,000
+    partition-compatible ops (coord-0 exact condition): 92,714,132,416
+    reason: BASELINE never completed for this key
+key tt|8|0 bins=(('xy', 14), ('xy', 4), ('z', 6), ('w', 5)) sizes=[400000, 400000, 142690, 91727] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 13,088,525,630 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 104,868,205,040,000
+    partition-compatible ops (coord-0 exact condition): 93,385,517,263
+    reason: BASELINE never completed for this key
+key tt|9|0 bins=(('xy', 14), ('xy', 8), ('z', 6), ('w', 1)) sizes=[400000, 400000, 142690, 83223] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 11,875,089,870 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 95,160,718,960,000
+    partition-compatible ops (coord-0 exact condition): 92,256,515,996
+    reason: BASELINE never completed for this key
+key tt|10|0 bins=(('xy', 16), ('xy', 2), ('z', 6), ('w', 1)) sizes=[400000, 400000, 142690, 83223] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 11,875,089,870 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 95,160,718,960,000
+    partition-compatible ops (coord-0 exact condition): 92,132,509,075
+    reason: BASELINE never completed for this key
+key tt|11|0 bins=(('xy', 18), ('xy', 0), ('z', 2), ('w', 1)) sizes=[400000, 400000, 125233, 83223] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 10,422,265,959 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 83,538,127,672,000
+    partition-compatible ops (coord-0 exact condition): 90,608,123,262
+    reason: BASELINE never completed for this key
+worker 2 TOTALS: current engine 1,384,290,007,888,000 ops (~27466.1 h at 14M/s); partitioned 1,136,151,893,779 ops (~22.54 h)
+
+=== worker 3 route=tt n=56 ===
+matchstate: opt_version OK (3 vs 3); fingerprints DISCARDED (fingerprint/opt mismatch); last update 2026-07-11 22:13:21
+key tt|0|0 bins=(('xy', 4), ('xy', 2), ('z', 6), ('w', 11)) sizes=[400000, 400000, 142690, 128887] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 18,390,886,030 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 147,287,088,240,000
+    partition-compatible ops (coord-0 exact condition): 98,573,422,734
+    reason: BASELINE never completed for this key
+key tt|1|0 bins=(('xy', 6), ('xy', 0), ('z', 10), ('w', 7)) sizes=[400000, 400000, 181432, 100828] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 18,293,425,696 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 146,507,405,568,000
+    partition-compatible ops (coord-0 exact condition): 98,442,435,776
+    reason: BASELINE never completed for this key
+key tt|2|0 bins=(('xy', 8), ('xy', 6), ('z', 6), ('w', 9)) sizes=[400000, 400000, 142690, 113275] marks=[0, 0, 0, 0] tri=(False, False)
+    quads covered 0.0%; pending build 160,000,000,000 + probe 16,163,209,750 pair-ops
+    CURRENT engine true ops (chunk x reprobe): 129,465,678,000,000
+    partition-compatible ops (coord-0 exact condition): 96,471,220,013
+    reason: BASELINE never completed for this key
+
+=== evidence/errors ===
+logs/dashboard_gs_temp_20260711_224641.log:2:Exception occurred during processing of request from ('127.0.0.1', 49863)
+logs/dashboard_gs_temp_20260711_224641.log:3:Traceback (most recent call last):
+logs/dashboard_gs_temp_20260711_224641.log:18:BrokenPipeError: [Errno 32] Broken pipe
+logs/dashboard_gs_temp_20260711_224641.log:21:Exception occurred during processing of request from ('127.0.0.1', 51189)
+logs/dashboard_gs_temp_20260711_224641.log:22:Traceback (most recent call last):
+logs/dashboard_gs_temp_20260711_224641.log:37:BrokenPipeError: [Errno 32] Broken pipe
+logs/dashboard_gs_temp_20260711_224641.log:40:Exception occurred during processing of request from ('127.0.0.1', 51357)
+logs/dashboard_gs_temp_20260711_224641.log:41:Traceback (most recent call last):
+logs/dashboard_gs_temp_20260711_224641.log:56:BrokenPipeError: [Errno 32] Broken pipe
+logs/dashboard_20260710_224355.log:2:Exception occurred during processing of request from ('192.168.1.220', 50995)
+logs/dashboard_20260710_224355.log:4:Exception occurred during processing of request from ('127.0.0.1', 58700)
+logs/dashboard_20260710_224355.log:6:Exception occurred during processing of request from ('127.0.0.1', 58704)
+logs/dashboard_20260710_224355.log:7:Traceback (most recent call last):
+logs/dashboard_20260710_224355.log:26:BrokenPipeError: [Errno 32] Broken pipe
+logs/dashboard_20260710_224355.log:28:Traceback (most recent call last):
+logs/dashboard_20260710_224355.log:29:Traceback (most recent call last):
+logs/dashboard_20260710_224355.log:66:BrokenPipeError: [Errno 32] Broken pipe
+logs/dashboard_20260710_224355.log:67:BrokenPipeError: [Errno 32] Broken pipe
+logs/dashboard_20260710_224355.log:71:Exception occurred during processing of request from ('192.168.1.220', 50994)
+logs/dashboard_20260710_224355.log:73:Exception occurred during processing of request from ('127.0.0.1', 58698)
+logs/dashboard_20260710_224355.log:74:Traceback (most recent call last):
+logs/dashboard_20260710_224355.log:75:Traceback (most recent call last):
+logs/dashboard_20260710_224355.log:112:BrokenPipeError: [Errno 32] Broken pipe
+logs/dashboard_20260710_224355.log:113:BrokenPipeError: [Errno 32] Broken pipe

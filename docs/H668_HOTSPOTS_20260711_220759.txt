@@ -1,0 +1,34 @@
+READ-ONLY audit: nothing under the workdir is written.
+
+=== GS (real data: work/worker_000, read-only) ===
+pools: 565,724 rows across 13 bins; 0 at cap (100,000)
+phase                                                 measured  est/cycle  %cycle  note
+matching (pending 81,716,936,976 pair-ops over 30 keys)     0.00s   6213.39s   99.1%  rate sampled 13,151,752/s
+checkpoint: caches.npz save                             13.92s     13.92s    0.2%  EVERY cycle, 282 MB raw, incl. unchanged capped bins
+generate+sieve (roomiest bin 1, 200,000)                 0.79s     10.26s    0.2%  216 pass sieve (0.11%); est x13 open bins/cycle
+checkpoint: pools.npz savez_compressed                  10.18s     10.18s    0.2%  EVERY cycle, all 13 bins, even unchanged capped ones
+generate+sieve (fullest bin 25, 200,000)                 0.78s     10.18s    0.2%  316 pass sieve (0.16%); est x13 open bins/cycle
+PAF cache build (56,914 rows)                            0.45s      5.89s    0.1%  only on cache miss/absorb; x bins worst case
+PSD cache build (56,914 rows)                            0.23s      2.94s    0.0%  only on cache miss/absorb; x bins worst case
+Pool.add canonical dedup                                 0.00s      0.03s    0.0%  316 rows, dup 0%
+telemetry/progress write                                 0.00s      0.00s    0.0%  negligible
+ESTIMATED CYCLE TOTAL                                            6266.80s
+
+=== TT (real data: work/worker_009, read-only) ===
+pools: 5,053,533 rows across 19 bins; 16 at cap (100,000)
+phase                                                 measured  est/cycle  %cycle  note
+matching (pending 3,840,000,000,000 pair-ops over 12 keys)     0.00s 267849.92s  100.0%  rate sampled 14,336,387/s
+checkpoint: caches.npz save                             77.82s     77.82s    0.0%  EVERY cycle, 1,850 MB raw, incl. unchanged capped bins
+checkpoint: pools.npz savez_compressed                  28.76s     28.76s    0.0%  EVERY cycle, all 19 bins, even unchanged capped ones
+PAF cache build (400,000 rows)                           0.36s      6.84s    0.0%  only on cache miss/absorb; x bins worst case
+PSD cache build (400,000 rows)                           0.18s      3.46s    0.0%  only on cache miss/absorb; x bins worst case
+generate+sieve (fullest bin ('xy', 18), 200,000)         0.80s      2.40s    0.0%  183,787 pass sieve (91.89%); est x3 open bins/cycle
+generate+sieve (roomiest bin ('w', 1), 200,000)          0.78s      2.34s    0.0%  4,697 pass sieve (2.35%); est x3 open bins/cycle
+Pool.add canonical dedup                                 0.67s      2.02s    0.0%  183,787 rows, dup 0%
+telemetry/progress write                                 0.00s      0.00s    0.0%  negligible
+ESTIMATED CYCLE TOTAL                                          267973.56s
+
+Interpretation guide (proof packet):
+ * checkpoint phases -> rule 11 (churn reduction is scheduling, explicitly safe)
+ * generate/dedup in dup-saturated bins -> rule 11 (prioritize bins with room; reachability must be proven)
+ * matching -> rules 5-7 only (no new candidate filters without proof tests)

@@ -1,0 +1,452 @@
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before8/bench_screen.py h668_hardened/bench_screen.py
+--- h668_before8/bench_screen.py	1970-01-01 00:00:00.000000000 +0000
++++ h668_hardened/bench_screen.py	2026-07-11 03:20:10.607075974 +0000
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++"""K-sweep benchmark for the PSD pair screen on SIEVE-PASSING candidates
++(the realistic population -- raw random sequences overstate rejection)."""
++import os
++import time
++from collections import defaultdict
++
++import numpy as np
++
++
++def main():
++    import core
++    import worker as wk
++    rng = np.random.default_rng(3)
++    route = wk.GSRoute(167)
++    seqs = []
++    while len(seqs) < 500:
++        batch = route.generate(3, 200000, rng)
++        seqs.extend(list(batch))
++    seqs = np.array(seqs[:500], np.int8)
++    print(f"fixture: {len(seqs)} sieve-passing symmetric candidates "
++          f"(n=167, |sum|=3)")
++    print(f"{'K':>3} {'rejected%':>10} {'pairs hashed':>13} "
++          f"{'wall s':>8} {'eff pair ops/sec':>17}")
++    base = None
++    for k in (0, 1, 2, 4, 8, 16):
++        os.environ["H668_SCREEN_K"] = str(max(k, 1))
++        import importlib
++        import engine
++        importlib.reload(engine)
++        psd = engine.psd_rows_periodic(seqs)
++        paf = core.paf_half_batch(seqs)
++        s = defaultdict(int)
++        t0 = time.perf_counter()
++        if k == 0:
++            engine.match(paf, paf, paf, paf, max_pairs=10**12, stats=s)
++        else:
++            engine.match(paf, paf, paf, paf, max_pairs=10**12, stats=s,
++                         psd1=(psd, psd, 668.0), psd2=(psd, psd, 668.0))
++        dt = time.perf_counter() - t0
++        attempted = s["pairs_hashed"] + s["psd_skipped"] // 2
++        rej = 100 * (s["psd_skipped"] / 2) / max(attempted, 1)
++        eff = attempted / dt
++        if base is None:
++            base = dt
++        print(f"{k:>3} {rej:>9.1f}% {s['pairs_hashed']:>13,} "
++              f"{dt:>8.3f} {eff:>17,.0f}  ({base/dt:.2f}x vs K=0)")
++    os.environ.pop("H668_SCREEN_K", None)
++
++
++if __name__ == "__main__":
++    main()
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before8/engine.py h668_hardened/engine.py
+--- h668_before8/engine.py	2026-07-11 03:18:39.967072610 +0000
++++ h668_hardened/engine.py	2026-07-11 03:19:16.951406940 +0000
+@@ -95,22 +95,48 @@
+     return (np.abs(F[:, 1:]) ** 2).astype(np.float32)
+ 
+ 
+-def _screen(psdX, wX, psdY, cap):
+-    """Boolean (nx, ny): True where the pair SURVIVES the screen."""
++SCREEN_K = int(os.environ.get("H668_SCREEN_K", "4"))
++
++
++def top_freqs(psd, k=None):
++    """Per-row indices of the k largest-PSD frequencies (int32, (n,k))."""
++    k = k or SCREEN_K
++    k = max(1, min(k, psd.shape[1]))
++    idx = np.argpartition(-psd, k - 1, axis=1)[:, :k]
++    order = np.take_along_axis(psd, idx, axis=1).argsort(axis=1)[:, ::-1]
++    return np.take_along_axis(idx, order, axis=1).astype(np.int32)
++
++
++def _screen(psdX, wX, psdY, wY, cap):
++    """Boolean (nx, ny): True where the pair SURVIVES. Checks each side's
++    top-K frequencies; sound because a valid pair satisfies the cap at
++    EVERY frequency (see tests_screen.py)."""
+     if psdX is None or cap is None or cap <= 0:
+         return None
+-    vals = psdX[np.arange(len(psdX)), wX]          # PSD_x at its own w*
+-    return vals[:, None] + psdY[:, wX.astype(np.intp)].T <= cap + 1e-6
++    ok = np.ones((len(psdX), len(psdY)), dtype=bool)
++    for t in range(wX.shape[1]):
++        w = wX[:, t]
++        vals = psdX[np.arange(len(psdX)), w]
++        ok &= vals[:, None] + psdY[:, w.astype(np.intp)].T <= cap + 1e-6
++    if wY is not None:
++        for t in range(wY.shape[1]):
++            w = wY[:, t]
++            vals = psdY[np.arange(len(psdY)), w]
++            ok &= (psdX[:, w.astype(np.intp)]
++                   + vals[None, :] <= cap + 1e-6)
++    return ok
+ 
+ 
+ def _numpy_match(pafA, pafB, pafC, pafD, wt1, wt2, stats,
+                  psd1=None, psd2=None, collision_log=None, lo=0):
+     psdA, psdB, cap1 = psd1 if psd1 else (None, None, None)
+     psdC, psdD, cap2 = psd2 if psd2 else (None, None, None)
+-    wA = psdA.argmax(axis=1).astype(np.int32) if psdA is not None else None
+-    wC = psdC.argmax(axis=1).astype(np.int32) if psdC is not None else None
+-    ok1 = _screen(psdA, wA, psdB, cap1) if psdA is not None else None
+-    ok2 = _screen(psdC, wC, psdD, cap2) if psdC is not None else None
++    wA = top_freqs(psdA) if psdA is not None else None
++    wB = top_freqs(psdB) if psdB is not None else None
++    wC = top_freqs(psdC) if psdC is not None else None
++    wD = top_freqs(psdD) if psdD is not None else None
++    ok1 = _screen(psdA, wA, psdB, wB, cap1) if psdA is not None else None
++    ok2 = _screen(psdC, wC, psdD, wD, cap2) if psdC is not None else None
+ 
+     table = defaultdict(list)
+     for i in range(len(pafA)):
+@@ -184,6 +210,7 @@
+               collision_log=None, lo=0):
+     out = (ctypes.c_longlong * 4)()
+     st = (ctypes.c_longlong * 5)()
++    use_v5 = hasattr(lib, "match_pairs_v5")
+     use_v4 = hasattr(lib, "match_pairs_v4")
+     coll_buf = (ctypes.c_longlong * (64 * 4))()
+     coll_n = ctypes.c_longlong(0)
+@@ -202,22 +229,36 @@
+ 
+     if psd1:
+         psdA, psdB, cap1 = psd1
+-        wA = psdA.argmax(axis=1).astype(np.int32)
+-        F = psdA.shape[1]
++        wA, wB = top_freqs(psdA), top_freqs(psdB)
++        F, K = psdA.shape[1], wA.shape[1]
+     else:
+-        psdA = psdB = wA = None
+-        cap1, F = 0.0, 0
++        psdA = psdB = wA = wB = None
++        cap1, F, K = 0.0, 0, 0
+     if psd2:
+         psdC, psdD, cap2 = psd2
+-        wC = psdC.argmax(axis=1).astype(np.int32)
+-        F = psdC.shape[1]
++        wC, wD = top_freqs(psdC), top_freqs(psdD)
++        F, K = psdC.shape[1], wC.shape[1]
+     else:
+-        psdC = psdD = wC = None
++        psdC = psdD = wC = wD = None
+         cap2 = 0.0
+     # keep references alive through the call
+     holders = [np.ascontiguousarray(x, dtype=np.float32)
+                for x in (psdA, psdB, psdC, psdD) if x is not None]
+-    if use_v4:
++    if use_v5:
++        found = lib.match_pairs_v5(
++            P16(A), len(A), P16(pafB), len(pafB),
++            P16(pafC), len(pafC), P16(pafD), len(pafD),
++            h, wt1, wt2,
++            PF(psdA), PI(wA), PF(psdB), PI(wB),
++            PF(psdC), PI(wC), PF(psdD), PI(wD),
++            F, K, cap1, cap2, out, st, coll_buf, 64,
++            ctypes.byref(coll_n))
++        if collision_log is not None:
++            for x in range(coll_n.value):
++                collision_log.append(
++                    (coll_buf[4 * x] + lo, coll_buf[4 * x + 1],
++                     coll_buf[4 * x + 2], coll_buf[4 * x + 3]))
++    elif use_v4:
+         found = lib.match_pairs_v4(
+             P16(A), len(A), P16(pafB), len(pafB),
+             P16(pafC), len(pafC), P16(pafD), len(pafD),
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before8/fastmatch.cpp h668_hardened/fastmatch.cpp
+--- h668_before8/fastmatch.cpp	2026-07-11 03:18:39.975217278 +0000
++++ h668_hardened/fastmatch.cpp	2026-07-11 03:18:40.063072613 +0000
+@@ -309,3 +309,104 @@
+     }
+     return 0;
+ }
++
++// v5: multi-frequency PSD pair screen. Instead of testing only each
++// candidate's single peak frequency, test its top-K frequencies AND the
++// partner's top-K (2K lookups max, early exit). Soundness is unchanged:
++// an exact match satisfies PSD_x(w)+PSD_y(w) <= cap at EVERY frequency,
++// so rejecting on any per-frequency violation can never lose a match.
++// K=1 with one-sided check reproduces v4 screening semantics.
++static inline bool psd_reject(const float *px, const float *py,
++                              const int32_t *wx, const int32_t *wy,
++                              int64_t x, int64_t y, int64_t F,
++                              int64_t K, float cap) {
++    const int32_t *ax = wx + x * K;
++    for (int64_t t = 0; t < K; t++) {
++        int32_t w = ax[t];
++        if (w < 0) break;
++        if (px[x * F + w] + py[y * F + w] > cap + 1e-6f) return true;
++    }
++    if (wy) {
++        const int32_t *by = wy + y * K;
++        for (int64_t t = 0; t < K; t++) {
++            int32_t w = by[t];
++            if (w < 0) break;
++            if (px[x * F + w] + py[y * F + w] > cap + 1e-6f) return true;
++        }
++    }
++    return false;
++}
++
++extern "C" int64_t match_pairs_v5(
++    const int16_t *pafA, int64_t na, const int16_t *pafB, int64_t nb,
++    const int16_t *pafC, int64_t nc, const int16_t *pafD, int64_t nd,
++    int64_t h, int16_t wt1, int16_t wt2,
++    const float *psdA, const int32_t *wA, const float *psdB,
++    const int32_t *wB,
++    const float *psdC, const int32_t *wC, const float *psdD,
++    const int32_t *wD,
++    int64_t F, int64_t K, float cap1, float cap2,
++    int64_t *out_idx, int64_t *stats,
++    int64_t *coll_out, int64_t coll_cap, int64_t *coll_n) {
++
++    for (int i = 0; i < 5; i++) stats[i] = 0;
++    *coll_n = 0;
++    if (na * nb == 0 || nc * nd == 0) return 0;
++    const bool s1 = psdA && psdB && wA && cap1 > 0 && K > 0;
++    const bool s2 = psdC && psdD && wC && cap2 > 0 && K > 0;
++
++    uint64_t cap = 1;
++    while ((int64_t)cap < 2 * na * nb) cap <<= 1;
++    std::vector<uint64_t> keys(cap, 0);
++    std::vector<uint32_t> ai(cap), bj(cap);
++    std::vector<int16_t> buf(h);
++
++    for (int64_t i = 0; i < na; i++) {
++        const int16_t *ra = pafA + i * h;
++        for (int64_t j = 0; j < nb; j++) {
++            if (s1 && psd_reject(psdA, psdB, wA, wB, i, j, F, K, cap1)) {
++                stats[4]++; continue;
++            }
++            combine_rows(ra, pafB + j * h, wt1, buf.data(), h);
++            uint64_t k = hash64w(buf.data(), h), pos = k & (cap - 1);
++            while (keys[pos] != 0) pos = (pos + 1) & (cap - 1);
++            keys[pos] = k; ai[pos] = (uint32_t)i; bj[pos] = (uint32_t)j;
++            stats[0]++;
++        }
++    }
++    stats[1] = stats[0];
++
++    std::vector<int16_t> probe(h), chk(h);
++    for (int64_t k2 = 0; k2 < nc; k2++) {
++        const int16_t *rc = pafC + k2 * h;
++        for (int64_t l = 0; l < nd; l++) {
++            if (s2 && psd_reject(psdC, psdD, wC, wD, k2, l, F, K, cap2)) {
++                stats[4]++; continue;
++            }
++            combine_rows(rc, pafD + l * h, (int16_t)(-wt2),
++                         probe.data(), h);
++            stats[2]++;
++            uint64_t k = hash64w(probe.data(), h), pos = k & (cap - 1);
++            while (keys[pos] != 0) {
++                if (keys[pos] == k) {
++                    stats[3]++;
++                    int64_t i = ai[pos], j = bj[pos];
++                    if (*coll_n < coll_cap) {
++                        int64_t *rec = coll_out + (*coll_n) * 4;
++                        rec[0] = i; rec[1] = j; rec[2] = k2; rec[3] = l;
++                        (*coll_n)++;
++                    }
++                    combine_rows(pafA + i * h, pafB + j * h, wt1,
++                                 chk.data(), h);
++                    if (std::memcmp(chk.data(), probe.data(), h * 2) == 0) {
++                        out_idx[0] = i; out_idx[1] = j;
++                        out_idx[2] = k2; out_idx[3] = l;
++                        return 1;
++                    }
++                }
++                pos = (pos + 1) & (cap - 1);
++            }
++        }
++    }
++    return 0;
++}
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before8/native.py h668_hardened/native.py
+--- h668_before8/native.py	2026-07-11 03:18:40.029233320 +0000
++++ h668_hardened/native.py	2026-07-11 03:19:16.925849743 +0000
+@@ -39,6 +39,25 @@
+         ctypes.c_longlong, ctypes.c_float, ctypes.c_float,
+         ctypes.POINTER(ctypes.c_longlong),
+         ctypes.POINTER(ctypes.c_longlong)]
++    if hasattr(lib, "match_pairs_v5"):
++        lib.match_pairs_v5.restype = ctypes.c_longlong
++        lib.match_pairs_v5.argtypes = (
++            [ctypes.POINTER(ctypes.c_int16), ctypes.c_longlong] * 4 + [
++                ctypes.c_longlong, ctypes.c_int16, ctypes.c_int16,
++                ctypes.POINTER(ctypes.c_float),
++                ctypes.POINTER(ctypes.c_int32),
++                ctypes.POINTER(ctypes.c_float),
++                ctypes.POINTER(ctypes.c_int32),
++                ctypes.POINTER(ctypes.c_float),
++                ctypes.POINTER(ctypes.c_int32),
++                ctypes.POINTER(ctypes.c_float),
++                ctypes.POINTER(ctypes.c_int32),
++                ctypes.c_longlong, ctypes.c_longlong,
++                ctypes.c_float, ctypes.c_float,
++                ctypes.POINTER(ctypes.c_longlong),
++                ctypes.POINTER(ctypes.c_longlong),
++                ctypes.POINTER(ctypes.c_longlong), ctypes.c_longlong,
++                ctypes.POINTER(ctypes.c_longlong)])
+     if hasattr(lib, "match_pairs_v4"):
+         lib.match_pairs_v4.restype = ctypes.c_longlong
+         lib.match_pairs_v4.argtypes = (
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before8/tests_screen.py h668_hardened/tests_screen.py
+--- h668_before8/tests_screen.py	1970-01-01 00:00:00.000000000 +0000
++++ h668_hardened/tests_screen.py	2026-07-11 03:20:10.599075974 +0000
+@@ -0,0 +1,142 @@
++"""Full-frequency PSD screen: proof tests. Run: python3 tests_screen.py
++House rule: a filter ships only if tests prove it never rejects a known
++valid construction."""
++import os
++import sys
++from collections import defaultdict
++
++import numpy as np
++
++import core
++import engine
++import worker as wk
++
++rng = np.random.default_rng(71)
++PASS = 0
++
++
++def check(name, cond):
++    global PASS
++    if not cond:
++        print(f"FAIL  {name}")
++        sys.exit(1)
++    PASS += 1
++    print(f"ok    {name}")
++
++
++route = wk.GSRoute(13)
++pools = {s: engine.Pool(13, True) for s in route.bins}
++for s in route.bins:
++    for _ in range(40):
++        if len(pools[s].seqs) >= 80:
++            break
++        pools[s].add(route.generate(s, 20000, rng),
++                     need=80 - len(pools[s].seqs))
++
++# ---- 1. PROOF CHECK: every pair of every known solution satisfies the cap
++#         at EVERY frequency (stronger than what the screen tests) ----------
++tested = 0
++for pat in route.patterns:
++    for (b1, b2), (b3, b4) in route.splits(pat):
++        pf = lambda b: core.paf_half_batch(pools[b].seqs)
++        sols = engine.find_all_matches(pf(b1), pf(b2), pf(b3), pf(b4))
++        psd = {b: engine.psd_rows_periodic(pools[b].seqs)
++               for b in (b1, b2, b3, b4)}
++        for (i, j, k, l) in sols:
++            assert np.all(psd[b1][i] + psd[b2][j] <= 4 * 13 + 1e-6)
++            assert np.all(psd[b3][k] + psd[b4][l] <= 4 * 13 + 1e-6)
++            tested += 2
++check(f"theorem: all {tested} known-solution pairs satisfy the PSD cap "
++      f"at every frequency (so no top-K subset can reject them)",
++      tested > 0)
++
++# ---- 2. screened solution set == complete solution set ---------------------
++diff = 0
++for pat in route.patterns:
++    for (b1, b2), (b3, b4) in route.splits(pat):
++        pf = lambda b: core.paf_half_batch(pools[b].seqs)
++        A, B, C, D = (pf(b) for b in (b1, b2, b3, b4))
++        ref = engine.find_all_matches(A, B, C, D)
++        psd = {b: engine.psd_rows_periodic(pools[b].seqs)
++               for b in (b1, b2, b3, b4)}
++        wA, wB = engine.top_freqs(psd[b1]), engine.top_freqs(psd[b2])
++        wC, wD = engine.top_freqs(psd[b3]), engine.top_freqs(psd[b4])
++        ok1 = engine._screen(psd[b1], wA, psd[b2], wB, 4 * 13)
++        ok2 = engine._screen(psd[b3], wC, psd[b4], wD, 4 * 13)
++        filt = {(i, j, k, l) for (i, j, k, l) in ref
++                if ok1[i, j] and ok2[k, l]}
++        if filt != ref:
++            diff += 1
++check("K=4 two-sided screen: filtered solution set == complete set on "
++      "every pattern/split", diff == 0)
++
++# ---- 3. TT(4) fixture passes at every frequency ------------------------------
++X = np.array([1, 1, 1, 1], np.int8)
++Y = np.array([1, 1, -1, 1], np.int8)
++Z = np.array([1, 1, -1, -1], np.int8)
++W = np.array([1, -1, 1], np.int8)
++pp = lambda s: engine.psd_rows_padded(np.asarray(s, np.int8)[None, :], 8)[0]
++m = 4
++check("TT(4) fixture: X+Y and Z+W satisfy their weighted caps at every "
++      "frequency",
++      np.all(pp(X) + pp(Y) <= 2 * (3 * m - 1) + 1e-6)
++      and np.all(pp(Z) + pp(W) <= (3 * m - 1) + 1e-6))
++
++# ---- 4. end-to-end with the new screen: production matcher still agrees
++#         with the exhaustive reference everywhere ----------------------------
++disagree = 0
++for pat in route.patterns:
++    for (b1, b2), (b3, b4) in route.splits(pat):
++        pf = lambda b: core.paf_half_batch(pools[b].seqs)
++        A, B, C, D = (pf(b) for b in (b1, b2, b3, b4))
++        psd = {b: engine.psd_rows_periodic(pools[b].seqs)
++               for b in (b1, b2, b3, b4)}
++        hit = engine.match(A, B, C, D, max_pairs=4_000_000,
++                           psd1=(psd[b1], psd[b2], 4 * 13),
++                           psd2=(psd[b3], psd[b4], 4 * 13))
++        ref = engine.find_all_matches(A, B, C, D)
++        if (hit is None) != (len(ref) == 0):
++            disagree += 1
++        if hit is not None:
++            core.verify_hadamard(core.gs_build(
++                [pools[b].seqs[x] for b, x in
++                 zip((b1, b2, b3, b4), hit)]))
++check("production matcher with K-screen agrees with exhaustive reference "
++      "and matches verify exactly", disagree == 0)
++
++# ---- 5. monotone strengthening: K=4 skips >= K=1 skips, matches unchanged ---
++seqs = rng.choice(np.array([-1, 1], np.int8), (150, 167))
++paf = core.paf_half_batch(seqs)
++psd = engine.psd_rows_periodic(seqs)
++skips = {}
++for k in (1, 4):
++    os.environ["H668_SCREEN_K"] = str(k)
++    import importlib
++    importlib.reload(engine)
++    s = defaultdict(int)
++    r = engine.match(paf, paf, paf, paf, max_pairs=10**12, stats=s,
++                     psd1=(psd, psd, 668.0), psd2=(psd, psd, 668.0))
++    skips[k] = (s["psd_skipped"], r)
++os.environ.pop("H668_SCREEN_K")
++importlib.reload(engine)
++check("K=4 rejects at least as much as K=1 with identical match outcome",
++      skips[4][0] >= skips[1][0] and (skips[4][1] is None)
++      == (skips[1][1] is None))
++
++# ---- 6. python/native parity of the new screen --------------------------------
++s_nat, s_py = defaultdict(int), defaultdict(int)
++r_nat = engine.match(paf, paf, paf, paf, max_pairs=10**12, stats=s_nat,
++                     psd1=(psd, psd, 668.0), psd2=(psd, psd, 668.0))
++lib = engine._LIB
++engine._LIB = None
++os.environ["H668_NATIVE"] = "0"
++r_py = engine.match(paf, paf, paf, paf, max_pairs=10**12, stats=s_py,
++                    psd1=(psd, psd, 668.0), psd2=(psd, psd, 668.0))
++os.environ.pop("H668_NATIVE")
++engine._LIB = lib
++check("python and native v5 screens: identical skips, pairs, and outcome",
++      s_nat["psd_skipped"] == s_py["psd_skipped"]
++      and s_nat["pairs_hashed"] == s_py["pairs_hashed"]
++      and (r_nat is None) == (r_py is None))
++
++print(f"\nALL {PASS} SCREEN PROOF TESTS PASSED")

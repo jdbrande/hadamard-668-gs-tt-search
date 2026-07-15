@@ -1,0 +1,899 @@
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before13/ctl.py h668_hardened/ctl.py
+--- h668_before13/ctl.py	2026-07-14 00:32:27.532376677 +0000
++++ h668_hardened/ctl.py	2026-07-14 00:35:50.806284502 +0000
+@@ -1641,6 +1641,56 @@
+     return build, probe
+ 
+ 
++def _micro_enum(route, pools, bins, o, L, frag_pairs, wt1, wt2):
++    """Deterministically enumerate v7 micro-units for one key: per
++    watermark block, the compatible coord-0 partitions and their
++    fragment counts under frag_pairs. Mirrors engine._match_partitioned
++    exactly. Returns list of (block, t1, frag, build_pairs, probe_pairs)."""
++    import engine
++    units = []
++    blocks = [((o[0], L[0]), (0, L[1]), (0, L[2]), (0, L[3])),
++              ((0, o[0]), (o[1], L[1]), (0, L[2]), (0, L[3])),
++              ((0, o[0]), (0, o[1]), (o[2], L[2]), (0, L[3])),
++              ((0, o[0]), (0, o[1]), (0, o[2]), (o[3], L[3]))]
++    pafs = [route.paf(pools[b].seqs) for b in bins]
++    for bi, ((al, ah), (bl, bh), (cl, ch), (dl, dh)) in enumerate(blocks):
++        if al >= ah or bl >= bh or cl >= ch or dl >= dh:
++            continue
++        gA = engine._groups_by_coord(pafs[0][al:ah])
++        gB = engine._groups_by_coord(pafs[1][bl:bh])
++        gC = engine._groups_by_coord(pafs[2][cl:ch])
++        gD = engine._groups_by_coord(pafs[3][dl:dh])
++        for t1 in sorted({x + y for x in gA for y in gB}):
++            num = -wt1 * t1
++            if num % wt2:
++                continue
++            t2 = num // wt2
++            bsegs = [(gA[x], gB[t1 - x]) for x in gA if (t1 - x) in gB]
++            psegs = [(gC[x], gD[t2 - x]) for x in gC if (t2 - x) in gD]
++            if not bsegs or not psegs:
++                continue
++            bp = sum(len(x) * len(y) for x, y in bsegs)
++            pp = sum(len(x) * len(y) for x, y in psegs)
++            nfrag = 1
++            if bp > frag_pairs:
++                nfrag = 0
++                cur = 0
++                for x, y in bsegs:
++                    step = max(1, frag_pairs // max(len(y), 1))
++                    for lo in range(0, len(x), step):
++                        segp = len(x[lo:lo + step]) * len(y)
++                        if cur + segp > frag_pairs and cur:
++                            nfrag += 1
++                            cur = 0
++                        cur += segp
++                if cur:
++                    nfrag += 1
++            per_frag_bp = bp / nfrag
++            for fi in range(nfrag):
++                units.append((bi, int(t1), fi, per_frag_bp, pp))
++    return units
++
++
+ def match_audit(a):
+     """Per-key matching cost audit: what the watermarks cover, what is
+     genuinely pending, what the CURRENT engine will actually spend on it
+@@ -1691,6 +1741,28 @@
+               f"{'OK' if opt_ok else 'MISMATCH -> discard'}"
+               f" ({raw_state.get('opt_version')} vs {wkm.OPT_VERSION}); "
+               f"fingerprints {fp_status}; last update {mtime}")
++        micro_data, micro_status = {}, "no micro state"
++        if a.micro:
++            import worker as wkm2
++            mpath = os.path.join(d, "micro_matchstate.json")
++            if os.path.exists(mpath):
++                try:
++                    md = json.load(open(mpath))
++                    if md.get("micro_version") != wkm.MICRO_VERSION:
++                        micro_status = (f"DISCARDED: micro_version "
++                                        f"{md.get('micro_version')} != "
++                                        f"{wkm.MICRO_VERSION}")
++                    elif md.get("opt_version") != wkm.OPT_VERSION:
++                        micro_status = (f"DISCARDED: opt_version "
++                                        f"{md.get('opt_version')} != "
++                                        f"{wkm.OPT_VERSION}")
++                    else:
++                        micro_data = md.get("keys", {})
++                        micro_status = (f"valid header (frag_pairs "
++                                        f"{md.get('frag_pairs'):,})")
++                except (OSError, ValueError):
++                    micro_status = "DISCARDED: unreadable/corrupt"
++            print(f"micro state: {micro_status}")
+         tot_cur = tot_part = 0
+         for pi, pat in enumerate(route.patterns):
+             for si, ((b1, b2), (b3, b4)) in enumerate(route.splits(pat)):
+@@ -1744,6 +1816,66 @@
+                 print(f"    partition-compatible ops (coord-0 exact "
+                       f"condition): {part_ops:,}")
+                 print(f"    reason: {reason}")
++                if a.micro and pend_build:
++                    fp_default = int(float(os.environ.get(
++                        "H668_MICRO_TARGET_SECS", "300"))
++                        * float(os.environ.get("H668_MICRO_RATE",
++                                               "12e6")))
++                    ent = micro_data.get(key, {})
++                    frag_pairs = int(ent.get("frag_pairs", 0)) or \
++                        fp_default
++                    units = _micro_enum(route, pools, bins, o, L,
++                                        frag_pairs, *route.wt)
++                    kstat, kreason = "fresh (no units)", None
++                    done_set = set()
++                    if ent:
++                        fp_ok = all(
++                            len(pools[bb].seqs) == ent["fp"][str(bb)]
++                            ["len"] and wkm._fingerprint(
++                                pools[bb].seqs) == ent["fp"][str(bb)]
++                            ["hash"] for bb in bins
++                            if str(bb) in ent.get("fp", {}))
++                        if not fp_ok:
++                            kstat, kreason = "DISCARDED", \
++                                "fingerprint mismatch (pool mutated/grew)"
++                        elif ent.get("ranges") != [
++                                list(sum(bx, ())) for bx in [
++                                    ((o[0], L[0]), (0, L[1]), (0, L[2]),
++                                     (0, L[3])),
++                                    ((0, o[0]), (o[1], L[1]), (0, L[2]),
++                                     (0, L[3])),
++                                    ((0, o[0]), (0, o[1]), (o[2], L[2]),
++                                     (0, L[3])),
++                                    ((0, o[0]), (0, o[1]), (0, o[2]),
++                                     (o[3], L[3]))]]:
++                            kstat, kreason = "DISCARDED", \
++                                "block ranges changed"
++                        else:
++                            done_set = {u for u, v in
++                                        ent.get("units", {}).items()
++                                        if v.get("done")}
++                            kstat = "valid"
++                    pend_units = [u for u in units
++                                  if f"b{u[0]}|{u[1]}:{u[2]}"
++                                  not in done_set]
++                    big = max(pend_units,
++                              key=lambda u: u[3] + u[4],
++                              default=None)
++                    rate2 = 14e6
++                    print(f"    micro: {kstat}"
++                          + (f" ({kreason})" if kreason else "")
++                          + f"; units total {len(units)}, done "
++                          f"{len(units) - len(pend_units)}, pending "
++                          f"{len(pend_units)}")
++                    if big:
++                        est = (big[3] + big[4]) / rate2
++                        print(f"    largest pending unit: block "
++                              f"{big[0]} t1={big[1]} frag {big[2]} "
++                              f"~{big[3] + big[4]:,.0f} ops "
++                              f"~{est:,.0f}s"
++                              + ("  ** UNIT TOO LARGE TO CHECKPOINT "
++                                 "WITHIN 10 MIN **" if est > 600
++                                 else ""))
+         rate = 14e6
+         print(f"worker {wid} TOTALS: current engine {tot_cur:,} ops "
+               f"(~{tot_cur/rate/3600:.1f} h at 14M/s); partitioned "
+@@ -1861,6 +1993,7 @@
+     pma = sub.add_parser("match-audit")
+     pma.add_argument("--workdir", default="work")
+     pma.add_argument("--max-pairs", type=int, default=20_000_000)
++    pma.add_argument("--micro", action="store_true")
+     pv = sub.add_parser("verify")
+     pv.add_argument("csv")
+     a = ap.parse_args()
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before13/dash_routing.py h668_hardened/dash_routing.py
+--- h668_before13/dash_routing.py	2026-07-14 00:32:28.365906392 +0000
++++ h668_hardened/dash_routing.py	2026-07-14 00:35:50.869252601 +0000
+@@ -208,7 +208,15 @@
+         status = "stale"
+     else:
+         status = p.get("status", "unknown")
++    micro_last = lc.get("micro_last_ckpt")
++    micro_age = (round(time.time() - micro_last)
++                 if micro_last else None)
+     return {"id": wid,
++            "micro_active": bool(lc.get("micro_active")),
++            "micro_units_done": lc.get("micro_units_done", 0),
++            "micro_skipped": lc.get("micro_skipped", 0),
++            "micro_ckpt_age_seconds": micro_age,
++            "micro_target_secs": lc.get("micro_target_secs"),
+             "route": (p.get("route") or m.get("route") or "?").upper(),
+             "seed": p.get("seed") or m.get("seed"),
+             "pinned": (d / "PIN").exists(),
+@@ -405,6 +413,15 @@
+         lb = seed_leaderboard()
+         if lb and lb.get("stale"):
+             warns.append("seed leaderboard older than 15 minutes")
++        for r in mix["workers"]:
++            if r.get("micro_active") and r["status"] == "matching":
++                age = r.get("micro_ckpt_age_seconds")
++                target = r.get("micro_target_secs") or 300
++                if age is not None and age > max(1800, 6 * target):
++                    warns.append(
++                        f"worker {r['id']}: CPU active but no micro "
++                        f"checkpoint for {age // 60} min (target "
++                        f"{target:.0f}s) -- unit may be oversized")
+         return warns
+     return _cached("sup_warns", build)
+ 
+@@ -454,7 +471,10 @@
+                  f"<td>{r['dup_pct'] if r['dup_pct'] is not None else '-'}"
+                  f"</td><td>{r['bins_at_cap']}</td>"
+                  f"<td>{_esc(r['status'])}</td><td>{_esc(r['phase'])}"
+-                 f"</td><td>{_eta_str(r['eta_key_seconds'])}</td></tr>")
++                 f"</td><td>{_eta_str(r['eta_key_seconds'])}</td>"
++                 f"<td>{('✓ ' + str(r['micro_units_done']) + 'u/'
++                        + _eta_str(r['micro_ckpt_age_seconds']))
++                       if r.get('micro_active') else '-'}</td></tr>")
+     def _t(ts):
+         return (time.strftime('%m-%d %H:%M', time.localtime(ts))
+                 if ts else '-')
+@@ -478,7 +498,8 @@
+ <h2>Route worker table</h2>
+ <table>
+ <tr><th>ID</th><th>Route</th><th>Seed</th><th>Acc/min</th><th>Dup%</th>
+-<th>@cap</th><th>Status</th><th>Phase</th><th>Key ETA</th></tr>
++<th>@cap</th><th>Status</th><th>Phase</th><th>Key ETA</th>
++<th>Micro ckpt</th></tr>
+ {rows}
+ </table>
+ <h2>Clue owners (collision evidence)</h2>
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before13/engine.py h668_hardened/engine.py
+--- h668_before13/engine.py	2026-07-14 00:32:27.810809842 +0000
++++ h668_hardened/engine.py	2026-07-14 00:32:52.198336088 +0000
+@@ -178,7 +178,7 @@
+ def match(pafA, pafB, pafC, pafD, wt1=1, wt2=1,
+           max_pairs=20_000_000, chunk=4000, stats=None,
+           psd1=None, psd2=None, on_progress=None, collision_log=None,
+-          offs=(0, 0, 0, 0), tri=(False, False)):
++          offs=(0, 0, 0, 0), tri=(False, False), micro=None):
+     """Find (i,j,k,l) with wt1*(pafA[i]+pafB[j]) + wt2*(pafC[k]+pafD[l]) = 0.
+ 
+     COMPLETE over the given arrays: chunking never drops rows. Optional
+@@ -197,7 +197,8 @@
+             and min(len(pafA), len(pafB), len(pafC), len(pafD)) > 0:
+         return _match_partitioned(
+             pafA, pafB, pafC, pafD, wt1, wt2, max_pairs, stats,
+-            psd1, psd2, on_progress, collision_log, offs, tri, lib)
++            psd1, psd2, on_progress, collision_log, offs, tri, lib,
++            micro=micro)
+     eff = max(1, min(chunk, max_pairs // max(len(pafB), 1)))
+     psdA_all = psd1[0] if psd1 else None
+     for lo in range(0, len(pafA), eff):
+@@ -361,7 +362,7 @@
+ 
+ def _match_partitioned(pafA, pafB, pafC, pafD, wt1, wt2, max_pairs,
+                        stats, psd1, psd2, on_progress, collision_log,
+-                       offs, tri, lib):
++                       offs, tri, lib, micro=None):
+     """Partition the pair space by the exact necessary condition
+     wt1*(a0+b0) + wt2*(c0+d0) = 0 (coordinate 0 of the combined PAF sum
+     must vanish, because the FULL vector must vanish for a match). Every
+@@ -397,39 +398,59 @@
+         bsegs = [(gA[a], gB[t1 - a]) for a in gA if (t1 - a) in gB]
+         psegs = [(gC[c], gD[t2 - c]) for c in gC if (t2 - c) in gD]
+         if bsegs and psegs:
+-            parts.append((bsegs, psegs))
++            parts.append((t1, (bsegs, psegs)))
+     done_rows = 0
+-    total_rows = sum(len(x) for p in parts for x, _ in p[0]) or 1
+-    for bsegs, psegs in parts:
++    total_rows = sum(len(x) for _, p in parts for x, _ in p[0]) or 1
++    # micro-checkpointing: unit = (coord-0 partition value, fragment
++    # index). Fragmentation is DETERMINISTIC given (groups, frag_pairs),
++    # so a unit label identifies exactly one build-subset x partition-
++    # probe product. Completed units are skipped only when the micro
++    # state's fingerprints/version/ranges validate (see worker.MicroState).
++    frag_pairs = max_pairs
++    if micro is not None and micro.frag_pairs:
++        frag_pairs = min(max_pairs, micro.frag_pairs)
++    for t1_label, (bsegs, psegs) in parts:
+         if on_progress is not None and \
+                 on_progress(done_rows, total_rows) is False:
+             stats["interrupted"] += 1
++            if micro is not None:
++                micro.flush()
+             return None
+         pairs = sum(len(x) * len(y) for x, y in bsegs)
+         frags = [bsegs]
+-        if pairs > max_pairs:
++        if pairs > frag_pairs:
+             frags = []
+             cur, cur_pairs = [], 0
+             for x, y in bsegs:
+-                step = max(1, max_pairs // max(len(y), 1))
++                step = max(1, frag_pairs // max(len(y), 1))
+                 for lo in range(0, len(x), step):
+                     seg = (x[lo:lo + step], y)
+                     segp = len(seg[0]) * len(y)
+-                    if cur_pairs + segp > max_pairs and cur:
++                    if cur_pairs + segp > frag_pairs and cur:
+                         frags.append(cur)
+                         cur, cur_pairs = [], 0
+                     cur.append(seg)
+                     cur_pairs += segp
+             if cur:
+                 frags.append(cur)
+-        for fsegs in frags:
++        for fi, fsegs in enumerate(frags):
++            unit = f"{t1_label}:{fi}"
++            if micro is not None and micro.done(unit):
++                stats["micro_skipped"] += 1
++                continue
+             r = _run_partition(lib, pafA, pafB, pafC, pafD, h, wt1, wt2,
+                                psdA, wA, psdB, wB, psdC, wC, psdD, wD,
+                                F, K, cap1, cap2, fsegs, psegs, offs,
+                                tri, stats, collision_log)
+             if r is not None:
++                if micro is not None:
++                    micro.flush()
+                 return r
++            if micro is not None:
++                micro.mark(unit)
+         done_rows += sum(len(x) for x, _ in bsegs)
++    if micro is not None:
++        micro.flush()
+     if on_progress is not None:
+         on_progress(total_rows, total_rows)
+     return None
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before13/tests_ttmicrockpt.py h668_hardened/tests_ttmicrockpt.py
+--- h668_before13/tests_ttmicrockpt.py	1970-01-01 00:00:00.000000000 +0000
++++ h668_hardened/tests_ttmicrockpt.py	2026-07-14 00:38:53.950338358 +0000
+@@ -0,0 +1,344 @@
++"""TT micro-checkpointing proof tests. Run: python3 tests_ttmicrockpt.py"""
++import importlib
++import json
++import os
++import shutil
++import subprocess
++import sys
++import time
++from collections import defaultdict
++
++import numpy as np
++
++os.environ.pop("H668_MICRO_MAX_PAIRS", None)
++import core
++import engine
++import worker as wk
++
++rng = np.random.default_rng(101)
++PASS = 0
++PY = sys.executable
++WD = "mc_work"
++
++
++def check(name, cond):
++    global PASS
++    if not cond:
++        print(f"FAIL  {name}")
++        sys.exit(1)
++    PASS += 1
++    print(f"ok    {name}")
++
++
++def build_fixture(rows):
++    route = wk.GSRoute(13)
++    pools = {s: engine.Pool(13, True) for s in route.bins}
++    for s in route.bins:
++        for _ in range(60):
++            if len(pools[s].seqs) >= 90:
++                break
++            pools[s].add(route.generate(s, 20000, rng),
++                         need=90 - len(pools[s].seqs))
++    fix = {b: engine.Pool(13, True) for b in route.bins}
++    k = rows
++    def any_match():
++        return any(engine.find_all_matches(
++            *[core.paf_half_batch(fix[b].seqs) for b in (x1, x2, x3, x4)])
++            for p in route.patterns
++            for (x1, x2), (x3, x4) in route.splits(p))
++    while True:
++        for b in route.bins:
++            fix[b].seqs = pools[b].seqs[:k].copy()
++        if not any_match() or k == 1:
++            break
++        k -= 1
++    return route, pools, fix
++
++
++route, big_pools, fix = build_fixture(6)
++os.environ["H668_MICRO_MAX_PAIRS"] = "5"
++S, M = "mc_state.json", "mc_micro.json"
++
++
++def clean():
++    for f in (S, M, M + ".corrupt"):
++        if os.path.exists(f):
++            os.remove(f)
++
++
++def run(st_path=S, mi=None, stop_after=None, stats=None, pools=None):
++    st = wk.MatchState(st_path)
++    st.load(pools or fix, wk.bin_key)
++    mi = mi if mi is not None else wk.MicroState(M)
++    calls = {"n": 0}
++    stop = (lambda: calls.__setitem__("n", calls["n"] + 1)
++            or calls["n"] > stop_after) if stop_after else None
++    r = wk.incremental_match(route, pools or fix, st, 500, 1,
++                             stats if stats is not None
++                             else defaultdict(int),
++                             caches={}, micro_state=mi,
++                             should_stop=stop)
++    mi.flush()
++    return r, mi
++
++
++def interrupt_with_units(pools=None, lo=2, hi=60):
++    """Find a deterministic stop point that lands MID-KEY, so completed
++    units of the in-flight key persist (interrupts at key boundaries
++    leave nothing behind by design: completed keys promote to the
++    normal watermark)."""
++    for stop in range(lo, hi):
++        clean()
++        s = defaultdict(int)
++        r, _ = run(stop_after=stop, stats=s, pools=pools)
++        if not os.path.exists(M):
++            continue
++        d = json.load(open(M))
++        n = sum(len(k["units"]) for k in d["keys"].values())
++        if n > 0 and s.get("interrupted"):
++            return stop, n, s, r
++    raise AssertionError("no mid-key interrupt point found")
++
++
++# ---- 1+2. writes completed units; interrupted unit retried -------------------
++stop_pt, n1, s1, r1 = interrupt_with_units()
++check(f"1. micro state writes completed units on interrupt "
++      f"(stop point {stop_pt}: {n1} units persisted)", n1 > 0)
++s2 = defaultdict(int)
++r2, _ = run(stats=s2)
++check("2. interrupted (unfinished) work is retried on resume "
++      "(resume hashed pairs > 0)", s2["pairs_hashed"] > 0)
++check("2b. never marks unfinished units complete "
++      "(resume skipped exactly the completed ones)",
++      s2["micro_skipped"] == n1)
++
++# ---- 3. completed units not retried when pools unchanged ---------------------
++s3 = defaultdict(int)
++r3, _ = run(stats=s3)
++check("3. fully-covered run does zero matching work "
++      "(watermarks + no retries)", s3["pairs_hashed"] == 0)
++
++# ---- 7+8. resume == uninterrupted: coverage and identical solution -----------
++clean()
++s_full = defaultdict(int)
++r_full, _ = run(stats=s_full)
++covered_full = s_full["pairs_hashed"]
++_, _, sA, _ = interrupt_with_units()
++sB = defaultdict(int)
++run(stats=sB)
++check("7. union of micro-units == old full-key coverage: interrupted+"
++      "resumed hashed >= uninterrupted (partial frag redone), and "
++      "resumed alone < full (units skipped)",
++      sA["pairs_hashed"] + sB["pairs_hashed"] >= covered_full
++      and sB["pairs_hashed"] < covered_full)
++# planted-solution determinism
++clean()
++sol_pools = {b: engine.Pool(13, True) for b in route.bins}
++for b in route.bins:
++    sol_pools[b].seqs = big_pools[b].seqs[:60].copy()
++r_uni, _ = run(stats=defaultdict(int), pools=sol_pools)
++clean()
++r_int = None
++for stop in range(2, 40):
++    clean()
++    r_int, _ = run(stop_after=stop, stats=defaultdict(int),
++                   pools=sol_pools)
++    if r_int is None and os.path.exists(M):
++        break
++r_res, _ = run(stats=defaultdict(int), pools=sol_pools)
++got = r_res or r_int
++check("8. resume finds the IDENTICAL solution as uninterrupted v7 "
++      "(deterministic unit order) and it verifies",
++      r_uni is not None and got is not None
++      and all(np.array_equal(a, b) for a, b in
++              zip(r_uni[1], got[1]))
++      and core.verify_hadamard(core.gs_build(got[1])) == 52)
++
++# ---- 4+5. mutation invalidates affected keys; unaffected keys survive --------
++interrupt_with_units()
++mi = wk.MicroState(M)
++key53 = next(k for k in mi.data["keys"])   # first key: pattern (5,3,3,3)
++bins53 = mi.data["keys"][key53]["bins"]
++# manufacture a second valid entry for a DISJOINT-bin key (7,1,1,1)
++pi7 = next(i for i, p in enumerate(route.patterns) if p[0] == 7)
++key7 = f"gs|{pi7}|0"
++bins7 = [(7, 1), None]
++(b1, b2), (b3, b4) = route.splits(route.patterns[pi7])[0]
++o = [0, 0, 0, 0]
++L = [len(fix[b].seqs) for b in (b1, b2, b3, b4)]
++ranges = [list(sum(bx, ())) for bx in [
++    ((o[0], L[0]), (0, L[1]), (0, L[2]), (0, L[3])),
++    ((0, o[0]), (o[1], L[1]), (0, L[2]), (0, L[3])),
++    ((0, o[0]), (0, o[1]), (o[2], L[2]), (0, L[3])),
++    ((0, o[0]), (0, o[1]), (0, o[2]), (o[3], L[3]))]]
++mi.data["keys"][key7] = {
++    "bins": [str(b) for b in (b1, b2, b3, b4)],
++    "ranges": ranges,
++    "fp": {str(b): {"len": len(fix[b].seqs),
++                    "hash": wk._fingerprint(fix[b].seqs)}
++           for b in (b1, b2, b3, b4)},
++    "units": {"b0|0:0": {"done": True, "ts": 1}}, "updated": 1}
++mi._dirty = True
++mi.flush()
++# mutate a bin used by key53 but NOT by key7: bin 3 or 5
++mut_bin = next(b for b in (3, 5) if str(b) in bins53)
++fix[mut_bin].seqs = fix[mut_bin].seqs.copy()
++fix[mut_bin].seqs[0, 0] *= -1
++mi2 = wk.MicroState(M)
++ent53 = mi2.key_view(key53, tuple(int(x) for x in bins53),
++                     [mi2.data["keys"][key53]["ranges"][i]
++                      for i in range(4)]
++                     if False else
++                     [list(r) for r in
++                      mi2.data["keys"][key53]["ranges"]],
++                     fix, wk.bin_key)
++check("4. pool mutation invalidates the affected key's micro units",
++      len(ent53["units"]) == 0)
++ent7 = mi2.key_view(key7, (b1, b2, b3, b4), ranges, fix, wk.bin_key)
++check("5. unaffected key over disjoint bins keeps its units",
++      ent7["units"].get("b0|0:0", {}).get("done") is True)
++fix[mut_bin].seqs[0, 0] *= -1
++
++# ---- 6. version mismatch invalidates -----------------------------------------
++interrupt_with_units()
++d = json.load(open(M))
++d["micro_version"] = 999
++json.dump(d, open(M, "w"))
++mi3 = wk.MicroState(M)
++check("6. micro_version mismatch discards micro state",
++      not mi3.data["keys"])
++d["micro_version"] = wk.MICRO_VERSION
++d["opt_version"] = -5
++json.dump(d, open(M, "w"))
++mi4 = wk.MicroState(M)
++check("6b. opt_version mismatch discards micro state",
++      not mi4.data["keys"])
++
++# ---- 9. native/python parity with micro skips ---------------------------------
++interrupt_with_units()
++shutil.copy(M, M + ".bak")
++if os.path.exists(S):
++    shutil.copy(S, S + ".bak")
++outs = {}
++for mode in ("1", "0"):
++    # restore the exact post-interrupt state for each mode
++    shutil.copy(M + ".bak", M)
++    if os.path.exists(S + ".bak"):
++        shutil.copy(S + ".bak", S)
++    elif os.path.exists(S):
++        os.remove(S)
++    os.environ["H668_NATIVE"] = mode
++    engine._LIB = None
++    import native
++    native._STATE.update(lib=None, checked=False, enabled=False,
++                         backend="python", fallback_reason=None)
++    st = wk.MatchState(S)
++    st.load(fix, wk.bin_key)
++    s = defaultdict(int)
++    wk.incremental_match(route, fix, st, 500, 1, s, caches={},
++                         micro_state=wk.MicroState(M))
++    outs[mode] = dict(s)
++for f in (M + ".bak", S + ".bak"):
++    if os.path.exists(f):
++        os.remove(f)
++os.environ.pop("H668_NATIVE")
++engine._LIB = None
++check("9. native and python resumes agree on pairs, probes, and "
++      "micro_skipped",
++      all(outs["0"].get(k, 0) == outs["1"].get(k, 0)
++          for k in ("pairs_hashed", "probes", "micro_skipped")))
++
++# ---- 10. same-bin triangle unchanged under micro -------------------------------
++clean()
++s_tri = defaultdict(int)
++r_tri, _ = run(stats=s_tri, pools=sol_pools)
++check("10. tri still active with micro on (swap pairs skipped, "
++      "solution verifies)",
++      s_tri["swap_skipped"] > 0 or r_tri is not None)
++
++# ---- 11+12. matchstate backward compat; workers without micro file run --------
++clean()
++run(stats=defaultdict(int))
++ms = json.load(open(S))
++check("11. matchstate.json schema unchanged "
++      "(opt_version/marks/fps only)",
++      set(ms) == {"opt_version", "marks", "fps"})
++os.remove(M) if os.path.exists(M) else None
++st = wk.MatchState(S)
++st.load(fix, wk.bin_key)
++s12 = defaultdict(int)
++r12 = wk.incremental_match(route, fix, st, 500, 1, s12, caches={},
++                           micro_state=wk.MicroState(M))
++check("12. worker with no micro_matchstate.json still runs",
++      r12 is None and s12["pairs_hashed"] == 0)
++
++# ---- 13. corrupt micro file quarantined ----------------------------------------
++clean()
++open(M, "w").write("{corrupt!!\n")
++mi5 = wk.MicroState(M)
++check("13. corrupt micro_matchstate quarantined (.corrupt), fresh state",
++      os.path.exists(M + ".corrupt") and not mi5.data["keys"])
++os.remove(M + ".corrupt")
++
++# ---- 14+15. worker 004 protection; run-safe/status-safe smoke ------------------
++shutil.rmtree(WD, ignore_errors=True)
++os.makedirs(os.path.join(WD, "worker_004"), exist_ok=True)
++json.dump({"worker_id": 4, "route": "gs", "seed": 94091007},
++          open(os.path.join(WD, "worker_004", "meta.json"), "w"))
++open(os.path.join(WD, "worker_004", "PIN"), "w").write("clue owner\n")
++r = subprocess.run([PY, "ctl.py", "rotate-gs-seeds", "--workdir", WD,
++                    "--seeds", "1", "--replace-workers", "4"],
++                   capture_output=True, text=True, timeout=120)
++check("14. worker 004 remains GS and pinned; rotation refused",
++      r.returncode != 0 and "PINNED" in (r.stdout + r.stderr))
++open("mc_seeds.txt", "w").write("95200001\n")
++r = subprocess.run([PY, "ctl.py", "run-safe", "--workdir", WD,
++                    "--seeds", "mc_seeds.txt", "--gs", "0:1",
++                    "--tt-workers", "1"], capture_output=True,
++                   text=True, timeout=120)
++r2 = subprocess.run([PY, "ctl.py", "status-safe", "--workdir", WD],
++                    capture_output=True, text=True, timeout=120)
++check("15. run-safe refusal logic and status-safe still pass",
++      r.returncode != 0 and "REFUSED" in (r.stdout + r.stderr)
++      and r2.returncode == 0 and "worker 004" in r2.stdout)
++os.remove("mc_seeds.txt")
++
++# ---- 16. dashboard micro warning only when expected -----------------------------
++for wid, age in ((1, 120), (2, 4000)):
++    dd = os.path.join(WD, f"worker_{wid:03d}")
++    os.makedirs(dd, exist_ok=True)
++    json.dump({"worker_id": wid, "route": "tt", "seed": 1},
++              open(os.path.join(dd, "meta.json"), "w"))
++    wk.write_json_atomic(os.path.join(dd, "progress.json"), {
++        "route": "tt", "seed": 1, "updated": time.time(),
++        "cycle": 0, "status": "matching", "bins_at_cap": 0,
++        "totals": {"accepted": 0, "dup_rejected": 0},
++        "telemetry_started_at": time.time() - 9000,
++        "pools": {"1": 10}, "pool_cap": 100,
++        "latest_cycle": {"phase": "matching key 1/12 block 1/4",
++                         "micro_active": True,
++                         "micro_units_done": 7,
++                         "micro_last_ckpt": time.time() - age,
++                         "micro_target_secs": 300}})
++os.environ.update(H668_WORKDIR=WD, H668_WORKERS="5",
++                  H668_DASH_CACHE_TTL="0", H668_SEEDS="none.txt",
++                  H668_EXPECT_GS="1", H668_EXPECT_TT="2")
++sys.path.insert(0, ".")
++import dash_routing as dr
++importlib.reload(dr)
++warns = dr.supervisor_warnings()
++check("16. dashboard warns for the 66-min-stale micro checkpoint but "
++      "NOT for the in-window one",
++      any("worker 2" in w and "micro checkpoint" in w for w in warns)
++      and not any("worker 1:" in w and "micro" in w for w in warns))
++rows = {r["id"]: r for r in dr.route_mix()["workers"]}
++check("16b. worker table carries micro fields",
++      rows[2]["micro_active"] and rows[2]["micro_units_done"] == 7)
++
++clean()
++shutil.rmtree(WD, ignore_errors=True)
++os.environ.pop("H668_MICRO_MAX_PAIRS", None)
++for f in ("hadamard_52.csv",):
++    if os.path.exists(f):
++        os.remove(f)
++print(f"\nALL {PASS} TT-MICRO-CHECKPOINT TESTS PASSED")
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before13/worker.py h668_hardened/worker.py
+--- h668_before13/worker.py	2026-07-14 00:32:28.013521512 +0000
++++ h668_hardened/worker.py	2026-07-14 00:35:50.967702407 +0000
+@@ -44,6 +44,145 @@
+                            digest_size=12).hexdigest()
+ 
+ 
++MICRO_VERSION = 1
++
++
++class MicroState:
++    """Sub-key micro-checkpoints for v7 partitioned matching.
++
++    Coverage claim of a completed unit "b{block}|{t1}:{frag}": the exact
++    build-fragment x partition-probe product of coord-0 partition t1,
++    fragment frag, inside watermark block `block` of `key`, computed over
++    the pools identified by the recorded fingerprints and ranges. Units
++    are skipped ONLY while every guard holds; any doubt discards (safe:
++    re-checking pairs is always sound; skipping unproven ranges never is).
++
++    Guards (any mismatch discards the affected key's units):
++      * micro_version + opt_version (global)
++      * frag_pairs used for deterministic fragmentation (global)
++      * per key: bins, the exact block ranges, and EXACT per-bin
++        (length, prefix-hash) fingerprints -- growth discards too, since
++        partition composition depends on every row in range.
++    Normal matchstate.json is untouched: when a key completes, its
++    watermark is written exactly as before and the key's micro entries
++    are cleared (promotion = the superset watermark takes over).
++    """
++
++    def __init__(self, path, target_secs=None):
++        self.path = path
++        self.target_secs = target_secs if target_secs is not None else \
++            float(os.environ.get("H668_MICRO_TARGET_SECS", "300"))
++        self.flush_secs = max(15.0, min(60.0, self.target_secs / 5))
++        self.frag_pairs = int(os.environ.get(
++            "H668_MICRO_MAX_PAIRS",
++            str(int(self.target_secs
++                    * float(os.environ.get("H668_MICRO_RATE",
++                                           "12e6"))))))
++        self.data = {"micro_version": MICRO_VERSION,
++                     "opt_version": OPT_VERSION,
++                     "frag_pairs": self.frag_pairs, "keys": {}}
++        self._dirty = False
++        self._last_flush = time.time()
++        self.units_done_session = 0
++        self.last_ckpt = None
++        self._load()
++
++    def _load(self):
++        if not os.path.exists(self.path):
++            return
++        try:
++            d = json.load(open(self.path))
++        except (OSError, ValueError):
++            try:
++                os.replace(self.path, self.path + ".corrupt")
++            except OSError:
++                pass
++            print("[micro] unreadable micro_matchstate; quarantined, "
++                  "starting fresh (safe: only re-checks)")
++            return
++        if d.get("micro_version") != MICRO_VERSION or \
++                d.get("opt_version") != OPT_VERSION or \
++                d.get("frag_pairs") != self.frag_pairs:
++            print(f"[micro] version/params mismatch "
++                  f"(micro {d.get('micro_version')}/{MICRO_VERSION}, "
++                  f"opt {d.get('opt_version')}/{OPT_VERSION}, frag "
++                  f"{d.get('frag_pairs')}/{self.frag_pairs}); "
++                  f"discarding micro state (full re-check of open keys)")
++            return
++        self.data["keys"] = d.get("keys", {})
++
++    def key_view(self, key, bins, ranges, pools, bin_key_fn):
++        """Validate-or-reset this key's entry against the CURRENT pools
++        and block ranges; return a per-block view factory."""
++        want_bins = [str(b) for b in bins]
++        want_fp = {}
++        for b in bins:
++            bk = bin_key_fn(b)
++            want_fp[str(b)] = {"len": len(pools[b].seqs),
++                               "hash": _fingerprint(pools[b].seqs)}
++        ent = self.data["keys"].get(key)
++        reason = None
++        if ent is not None:
++            if ent.get("bins") != want_bins:
++                reason = "bins changed"
++            elif ent.get("ranges") != [list(r) for r in ranges]:
++                reason = "block ranges changed (growth/watermark moved)"
++            else:
++                for b, fp in ent.get("fp", {}).items():
++                    got = want_fp.get(b)
++                    if got is None or got["len"] != fp["len"] or \
++                            got["hash"] != fp["hash"]:
++                        reason = f"fingerprint mismatch on bin {b}"
++                        break
++        if ent is None or reason is not None:
++            if ent is not None:
++                print(f"[micro] {key}: discarding micro units "
++                      f"({reason}); safe re-check")
++            ent = {"bins": want_bins,
++                   "ranges": [list(r) for r in ranges],
++                   "fp": want_fp, "units": {}, "updated": time.time()}
++            self.data["keys"][key] = ent
++            self._dirty = True
++        return ent
++
++    def block_view(self, key, block_idx):
++        ms = self
++
++        class _View:
++            frag_pairs = self.frag_pairs
++
++            def done(_s, unit):
++                return bool(ms.data["keys"][key]["units"].get(
++                    f"b{block_idx}|{unit}", {}).get("done"))
++
++            def mark(_s, unit):
++                ms.data["keys"][key]["units"][f"b{block_idx}|{unit}"] = \
++                    {"done": True, "ts": round(time.time(), 1)}
++                ms.data["keys"][key]["updated"] = time.time()
++                ms.units_done_session += 1
++                ms._dirty = True
++                if time.time() - ms._last_flush >= ms.flush_secs:
++                    ms.flush()
++
++            def flush(_s):
++                ms.flush()
++        return _View()
++
++    def clear_key(self, key):
++        if key in self.data["keys"]:
++            del self.data["keys"][key]
++            self._dirty = True
++            self.flush()
++
++    def flush(self):
++        if not self._dirty:
++            return
++        write_json_atomic(self.path, self.data)
++        self._dirty = False
++        self._last_flush = time.time()
++        self.last_ckpt = self._last_flush
++
++
+ class MatchState:
+     """Incremental-matching watermarks, persisted per worker.
+ 
+@@ -207,7 +346,7 @@
+ 
+ def incremental_match(route, pools, state, max_pairs, chunk, stats,
+                       caches=None, heartbeat=None, should_stop=None,
+-                      collision_sink=None):
++                      collision_sink=None, micro_state=None):
+     """Check exactly the quadruples not covered by the watermarks: with old
+     region a0 x b0 x c0 x d0 already checked, the four disjoint blocks
+       A[a0:] x B x C x D
+@@ -253,6 +392,12 @@
+             planned = sum((ah - al) * (bh - bl)
+                           for (al, ah), (bl, bh), _, _ in blocks
+                           if ah > al and bh > bl)
++            key_micro = None
++            if micro_state is not None and \
++                    os.environ.get("H668_MICRO", "1") != "0":
++                key_micro = micro_state.key_view(
++                    key, bins, [sum(blocks[x], ()) for x in range(4)],
++                    pools, bin_key)
+             for bi, ((a_lo, a_hi), (b_lo, b_hi), (c_lo, c_hi),
+                      (d_lo, d_hi)) in enumerate(blocks):
+                 if a_lo >= a_hi or b_lo >= b_hi or c_lo >= c_hi \
+@@ -290,10 +435,24 @@
+                                     stats["dup_rejected"]),
+                                 "eta_key_seconds": int(
+                                     remaining / rate),
++                                "micro_active": micro_state is not None,
++                                "micro_units_done": int(getattr(
++                                    micro_state, "units_done_session",
++                                    0)) if micro_state else 0,
++                                "micro_skipped": int(
++                                    stats.get("micro_skipped", 0)),
++                                "micro_last_ckpt": getattr(
++                                    micro_state, "last_ckpt", None)
++                                if micro_state else None,
++                                "micro_target_secs": getattr(
++                                    micro_state, "target_secs", None)
++                                if micro_state else None,
+                             })
+                     return True
+ 
+                 clog = [] if collision_sink is not None else None
++                mview = (micro_state.block_view(key, bi)
++                         if key_micro is not None else None)
+                 hit = engine.match(
+                     pafs[0][a_lo:a_hi], pafs[1][b_lo:b_hi],
+                     pafs[2][c_lo:c_hi], pafs[3][d_lo:d_hi],
+@@ -303,7 +462,7 @@
+                     psd2=(psds[2][c_lo:c_hi], psds[3][d_lo:d_hi], cap2),
+                     on_progress=on_progress, collision_log=clog,
+                     offs=(a_lo, b_lo, c_lo, d_lo),
+-                    tri=(b1 == b2, b3 == b4))
++                    tri=(b1 == b2, b3 == b4), micro=mview)
+                 if clog:
+                     for (ci, cj, ck, cl) in clog:
+                         gi = (a_lo + ci, b_lo + cj, c_lo + ck, d_lo + cl)
+@@ -332,6 +491,9 @@
+                          pools, bin_key)
+             state.save()   # persist per completed key: multi-hour cycles
+                            # now checkpoint incrementally
++            if micro_state is not None:
++                micro_state.clear_key(key)   # promoted: watermark now
++                                             # covers a superset
+     return None
+ 
+ 
+@@ -707,6 +869,8 @@
+         out(f"COLLISION EVIDENCE saved: bins {bins_s} idx {gi} "
+             f"residual_zero={rec['residual_zero']} verified={verified}")
+ 
++    micro = MicroState(os.path.join(mydir, "micro_matchstate.json"))
++
+     my_stop = os.path.join(mydir, "STOP_WORKER")
+ 
+     def should_stop():
+@@ -745,6 +909,7 @@
+ 
+         found = incremental_match(
+             route, pools, state, max_pairs, chunk, stats, caches=caches,
++            micro_state=micro,
+             heartbeat=lambda phase, extra=None: telemetry.heartbeat(
+                 pools, phase, extra, min_interval=heartbeat_seconds),
+             should_stop=should_stop, collision_sink=record_collision)

@@ -1,0 +1,687 @@
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before6/ctl.py h668_hardened/ctl.py
+--- h668_before6/ctl.py	2026-07-08 20:57:43.096799170 +0000
++++ h668_hardened/ctl.py	2026-07-08 20:58:10.507110767 +0000
+@@ -832,15 +832,27 @@
+         return done
+ 
+     if a.watch:
+-        tick = 0
+-        while True:
+-            tick += 1
+-            print(f"--- auto-rotate watch tick {tick} "
+-                  f"({time.strftime('%H:%M:%S')}) ---")
+-            one_pass()
+-            if a.max_ticks and tick >= a.max_ticks:
+-                return
+-            time.sleep(a.watch_interval_seconds)
++        pid_path = os.path.join(a.workdir, "auto_rotate.pid")
++        with open(pid_path, "w") as fh:
++            json.dump({"pid": os.getpid(),
++                       "cooldown_minutes": a.cooldown_minutes,
++                       "watch_interval_seconds": a.watch_interval_seconds,
++                       "started": time.time()}, fh)
++        try:
++            tick = 0
++            while True:
++                tick += 1
++                print(f"--- auto-rotate watch tick {tick} "
++                      f"({time.strftime('%H:%M:%S')}) ---")
++                one_pass()
++                if a.max_ticks and tick >= a.max_ticks:
++                    return
++                time.sleep(a.watch_interval_seconds)
++        finally:
++            try:
++                os.remove(pid_path)
++            except OSError:
++                pass
+     else:
+         one_pass()
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before6/dash_routing.py h668_hardened/dash_routing.py
+--- h668_before6/dash_routing.py	1970-01-01 00:00:00.000000000 +0000
++++ h668_hardened/dash_routing.py	2026-07-08 20:59:22.751139996 +0000
+@@ -0,0 +1,388 @@
++"""Read-only routing/auto-rotation panel logic for the kid dashboard.
++
++STRICTLY READ-ONLY: reads progress.json, cycles.jsonl tails,
++seed_rotations.jsonl tail, seeds.txt and work/auto_rotate.pid. Never
++writes, never starts or stops anything. Shares staleness semantics with
++ctl.py by importing ctl._gs_worker_assessment (single source of truth).
++Results are cached for CACHE_TTL seconds to keep the dashboard fast."""
++import json
++import os
++import time
++from pathlib import Path
++
++WORKDIR = Path(os.environ.get("H668_WORKDIR", "work"))
++EXPECTED = int(os.environ.get("H668_WORKERS", "12"))
++SEED_FILE = os.environ.get("H668_SEEDS", "seeds.txt")
++CACHE_TTL = float(os.environ.get("H668_DASH_CACHE_TTL", "5"))
++SEED_LOW = 20
++
++_cache = {}
++
++
++def _cached(key, fn):
++    now = time.time()
++    hit = _cache.get(key)
++    if hit and now - hit[0] < CACHE_TTL:
++        return hit[1]
++    val = fn()
++    _cache[key] = (now, val)
++    return val
++
++
++def _tail_lines(path, n):
++    """Tail without scanning giant files: read only the last ~256KB."""
++    try:
++        with open(path, "rb") as fh:
++            fh.seek(0, 2)
++            size = fh.tell()
++            fh.seek(max(0, size - 262144))
++            chunk = fh.read().decode(errors="ignore")
++        lines = chunk.splitlines()
++        return lines[-n:] if len(lines) >= n else lines
++    except OSError:
++        return []
++
++
++def _read_json(path):
++    try:
++        return json.loads(Path(path).read_text())
++    except Exception:
++        return {}
++
++
++def worker_dirs():
++    return sorted(WORKDIR.glob("worker_[0-9]*"))
++
++
++# ---------------------------------------------------------- seeds
++
++def seed_queue():
++    def build():
++        seeds = []
++        try:
++            for line in Path(SEED_FILE).read_text().splitlines():
++                line = line.strip()
++                if line and not line.startswith("#"):
++                    seeds.append(int(line))
++        except (OSError, ValueError):
++            pass
++        used_live, used_log = set(), set()
++        for d in worker_dirs():
++            s = _read_json(d / "meta.json").get("seed")
++            if s is not None:
++                used_live.add(int(s))
++        for line in _tail_lines(WORKDIR / "seed_rotations.jsonl", 500):
++            try:
++                used_log.add(int(json.loads(line)["new_seed"]))
++            except (ValueError, KeyError):
++                pass
++        used = used_live | used_log
++        unused = [s for s in seeds if s not in used]
++        return {"total_in_file": len(seeds), "remaining": len(unused),
++                "next_unused": unused[:5],
++                "used_by_live_workers": sorted(used_live),
++                "used_in_rotation_log": sorted(used_log),
++                "seed_file": SEED_FILE, "low": len(unused) < SEED_LOW}
++    return _cached("seeds", build)
++
++
++# ---------------------------------------------------------- rotations
++
++def rotation_history(n=10):
++    def build():
++        out = []
++        for line in _tail_lines(WORKDIR / "seed_rotations.jsonl", n * 3):
++            try:
++                r = json.loads(line)
++                out.append({
++                    "time": r.get("timestamp"),
++                    "worker_id": r.get("old_worker_id"),
++                    "old_seed": r.get("old_seed"),
++                    "new_seed": r.get("new_seed"),
++                    "reason": r.get("reason", ""),
++                    "old_accepted_per_min": r.get("old_accepted_per_min"),
++                    "old_dup_pct": r.get("old_dup_pct"),
++                    "old_cycle": r.get("old_cycle")})
++            except ValueError:
++                pass
++        return out[-n:]
++    return _cached("rot_hist", build)
++
++
++def autorotate_status():
++    def build():
++        pf = _read_json(WORKDIR / "auto_rotate.pid")
++        pid = pf.get("pid")
++        watch_alive = False
++        if pid:
++            try:
++                os.kill(int(pid), 0)
++                watch_alive = True
++            except (OSError, ValueError):
++                watch_alive = False
++        hist = rotation_history(200)
++        last_ts = max((r["time"] or 0 for r in hist), default=0)
++        midnight = time.time() - (time.time() % 86400)
++        today = sum(1 for r in hist if (r["time"] or 0) >= midnight)
++        cooldown_min = pf.get("cooldown_minutes")
++        cooldown_left = None
++        if cooldown_min and last_ts:
++            cooldown_left = max(
++                0.0, cooldown_min * 60 - (time.time() - last_ts))
++        latest = hist[-1] if hist else None
++        return {"watch_running": watch_alive,
++                "pid": pid if watch_alive else None,
++                "last_rotation": last_ts or None,
++                "rotations_today": today,
++                "cooldown_minutes": cooldown_min,
++                "cooldown_remaining_seconds":
++                    round(cooldown_left) if cooldown_left is not None
++                    else None,
++                "latest_reason": latest["reason"] if latest else None}
++    return _cached("rot_status", build)
++
++
++# ---------------------------------------------------------- assessment
++
++def assessments():
++    """Same verdict logic as auto-rotate, via ctl (read-only)."""
++    def build():
++        import ctl
++        out = []
++        for d in worker_dirs():
++            decision, info = ctl._gs_worker_assessment(
++                str(d), stale_cycles=10, dup_threshold=95.0, min_apm=1.0)
++            info["decision"] = decision
++            out.append(info)
++        return out
++    return _cached("assess", build)
++
++
++def _recent_apm(d, n=10):
++    recs = []
++    for line in _tail_lines(d / "cycles.jsonl", n):
++        try:
++            r = json.loads(line)
++            if r.get("secs", 0) > 0:
++                recs.append(r)
++        except ValueError:
++            pass
++    if not recs:
++        p = _read_json(d / "progress.json")
++        mins = max((p.get("updated", 0)
++                    - p.get("telemetry_started_at", 0)) / 60, 1e-9)
++        t = p.get("totals", {})
++        acc, dup = t.get("accepted", 0), t.get("dup_rejected", 0)
++        ex = acc + dup
++        return acc / mins, (100.0 * dup / ex if ex else None)
++    mins = max(sum(r["secs"] for r in recs) / 60, 1e-9)
++    acc = sum(r.get("accepted", 0) for r in recs)
++    dup = sum(r.get("dup_rejected", 0) for r in recs)
++    ex = acc + dup
++    return acc / mins, (100.0 * dup / ex if ex else None)
++
++
++def worker_row(wid):
++    d = WORKDIR / f"worker_{wid:03d}"
++    p = _read_json(d / "progress.json")
++    m = _read_json(d / "meta.json")
++    apm, dup_pct = _recent_apm(d)
++    lc = p.get("latest_cycle", {}) or {}
++    phase = str(lc.get("phase", ""))
++    eta = lc.get("eta_key_seconds")
++    updated = p.get("updated", 0)
++    age = time.time() - updated if updated else None
++    assess = next((a for a in assessments() if a.get("wid") == wid), {})
++    if p.get("status") == "stopped":
++        status = "stopped"
++    elif assess.get("decision") == "rotate" or (
++            dup_pct is not None and dup_pct >= 95 and apm < 1):
++        status = "duplicate-saturated"
++    elif p.get("status") == "matching" and age is not None and age < 120:
++        status = "matching"
++    elif apm >= 1:
++        status = "accepting"
++    elif age is not None and age > 3600 and p.get("cycle", 0) == 0:
++        status = "unproven busy"
++    elif p.get("cycle", 0) > 0 and apm < 1:
++        status = "stale"
++    else:
++        status = p.get("status", "unknown")
++    return {"id": wid,
++            "route": (p.get("route") or m.get("route") or "?").upper(),
++            "seed": m.get("seed"),
++            "accepted_per_min": round(apm, 1),
++            "dup_pct": round(dup_pct, 1) if dup_pct is not None else None,
++            "bins_at_cap": p.get("bins_at_cap", 0),
++            "status": status, "phase": phase or "-",
++            "eta_key_seconds": eta,
++            "cycle": p.get("cycle")}
++
++
++def route_mix():
++    def build():
++        rows = [worker_row(i) for i in range(EXPECTED)]
++        mix = {"gs": {"count": 0, "apm": 0.0},
++               "tt": {"count": 0, "apm": 0.0}}
++        for r in rows:
++            key = r["route"].lower()
++            if key in mix:
++                mix[key]["count"] += 1
++                mix[key]["apm"] += r["accepted_per_min"]
++        return {"workers": rows, "total": len(rows),
++                "gs": mix["gs"], "tt": mix["tt"]}
++    return _cached("routemix", build)
++
++
++def recommendation():
++    mix = route_mix()
++    plans = [a for a in assessments() if a.get("decision") == "rotate"]
++    if plans:
++        ids = sorted(a["wid"] for a in plans)
++        return (f"GS stale candidates found: workers {ids} — "
++                f"auto-rotate would act (dry-run to confirm)")
++    tt_rows = [r for r in mix["workers"] if r["route"] == "TT"]
++    silent_tt = [r for r in tt_rows if r["status"] in
++                 ("unproven busy", "unknown")]
++    if silent_tt:
++        return (f"TT heartbeat needed: workers "
++                f"{sorted(r['id'] for r in silent_tt)} are silent")
++    if mix["gs"]["count"] and not plans:
++        return "All GS productive"
++    return "No action needed"
++
++
++def badges():
++    plans = [a for a in assessments() if a.get("decision") == "rotate"]
++    rot = autorotate_status()
++    sq = seed_queue()
++    out = [("No stale GS workers", not plans),
++           ("Auto-rotate dry-run clean", not plans),
++           ("Watch mode active", rot["watch_running"]),
++           ("Seed queue low", sq["low"]),
++           ("Rotation cooldown active",
++            bool(rot["cooldown_remaining_seconds"]))]
++    return out
++
++
++# ---------------------------------------------------------- payloads
++
++def routing_payload():
++    return {"read_only": True, "route_mix": route_mix(),
++            "auto_rotate": autorotate_status(),
++            "seed_queue": seed_queue(),
++            "rotation_history": rotation_history(10),
++            "recommendation": recommendation(),
++            "badges": [{"label": l, "on": bool(v)} for l, v in badges()],
++            "updated": int(time.time())}
++
++
++def rotate_status_payload():
++    """Dry-run preview: what auto-rotate WOULD do. Read-only by
++    construction -- this module never writes and never signals workers."""
++    plans = [a for a in assessments() if a.get("decision") == "rotate"]
++    sq = seed_queue()
++    return {"read_only": True,
++            "note": "preview only; the dashboard never rotates workers",
++            "would_rotate": [
++                {"worker_id": p["wid"], "old_seed": p.get("seed"),
++                 "next_seed": (sq["next_unused"][i]
++                               if i < len(sq["next_unused"]) else None),
++                 "reason": p.get("why"),
++                 "accepted_per_min": p.get("apm"),
++                 "dup_pct": p.get("dup_pct")}
++                for i, p in enumerate(plans)],
++            "skips": [{"worker_id": a["wid"], "why": a.get("why")}
++                      for a in assessments()
++                      if a.get("decision") != "rotate"],
++            "updated": int(time.time())}
++
++
++# ---------------------------------------------------------- html
++
++def _esc(s):
++    import html as _h
++    return _h.escape(str(s))
++
++
++def _eta_str(sec):
++    if not sec:
++        return "-"
++    return f"{sec/3600:.1f}h" if sec >= 3600 else f"{sec/60:.0f}m"
++
++
++def render_routing_html():
++    mix = route_mix()
++    rot = autorotate_status()
++    sq = seed_queue()
++    hist = rotation_history(10)
++    badge_html = " ".join(
++        f'<span class="badge {"on" if on else "off"}">{_esc(label)}'
++        f'</span>' for label, on in badges())
++    cards = f"""
++    <div class="card"><div class="title">Route Mix</div>
++      <div class="value">{mix['gs']['count']} GS / {mix['tt']['count']} TT
++        of {mix['total']}</div>
++      <div class="desc">accepted/min — GS: {mix['gs']['apm']:,.0f},
++        TT: {mix['tt']['apm']:,.0f}</div></div>
++    <div class="card"><div class="title">Auto-Rotate</div>
++      <div class="value">{'WATCHING (pid ' + str(rot['pid']) + ')'
++                          if rot['watch_running'] else 'not watching'}</div>
++      <div class="desc">rotations today: {rot['rotations_today']};
++        last: {time.strftime('%H:%M', time.localtime(rot['last_rotation']))
++               if rot['last_rotation'] else 'never'};
++        cooldown left: {_eta_str(rot['cooldown_remaining_seconds'])};
++        latest reason: {_esc((rot['latest_reason'] or '-')[:90])}</div></div>
++    <div class="card"><div class="title">Seed Queue</div>
++      <div class="value">{sq['remaining']} left</div>
++      <div class="desc">next: {', '.join(map(str, sq['next_unused']))
++                              or '-'}; used by live: 
++        {len(sq['used_by_live_workers'])}; used in log:
++        {len(sq['used_in_rotation_log'])}</div></div>
++    <div class="card"><div class="title">Route Recommendation</div>
++      <div class="value" style="font-size:15px">{_esc(recommendation())}
++      </div><div class="desc">same rules as ctl.py recommend-routes /
++        auto-rotate-gs (read-only preview at /rotate-status.json)
++      </div></div>"""
++    rows = ""
++    for r in mix["workers"]:
++        rows += (f"<tr><td>w{r['id']}</td><td><b>{_esc(r['route'])}</b>"
++                 f"</td><td>{_esc(r['seed'] or '-')}</td>"
++                 f"<td>{r['accepted_per_min']:,}</td>"
++                 f"<td>{r['dup_pct'] if r['dup_pct'] is not None else '-'}"
++                 f"</td><td>{r['bins_at_cap']}</td>"
++                 f"<td>{_esc(r['status'])}</td><td>{_esc(r['phase'])}"
++                 f"</td><td>{_eta_str(r['eta_key_seconds'])}</td></tr>")
++    def _t(ts):
++        return (time.strftime('%m-%d %H:%M', time.localtime(ts))
++                if ts else '-')
++
++    hist_rows = "".join(
++        f"<tr><td>{_t(h['time'])}</td><td>w{h['worker_id']}</td>"
++        f"<td>{_esc(h['old_seed'])}</td><td>{_esc(h['new_seed'])}</td>"
++        f"<td>{_esc((h['reason'] or '')[:70])}</td>"
++        f"<td>{h['old_accepted_per_min']}</td><td>{h['old_dup_pct']}</td>"
++        f"<td>{h['old_cycle']}</td></tr>"
++        for h in reversed(hist)) or \
++        "<tr><td colspan=8>no rotations yet</td></tr>"
++    return f"""
++<div class="section">
++<h2>Routing &amp; Auto-Rotation</h2>
++<p>{badge_html}</p>
++<div class="cards">{cards}</div>
++<h2>Route worker table</h2>
++<table>
++<tr><th>ID</th><th>Route</th><th>Seed</th><th>Acc/min</th><th>Dup%</th>
++<th>@cap</th><th>Status</th><th>Phase</th><th>Key ETA</th></tr>
++{rows}
++</table>
++<h2>Rotation history (latest 10)</h2>
++<table>
++<tr><th>Time</th><th>Worker</th><th>Old seed</th><th>New seed</th>
++<th>Reason</th><th>Old acc/min</th><th>Old dup%</th><th>Old cycle</th></tr>
++{hist_rows}
++</table>
++<style>.badge{{padding:3px 8px;border-radius:9px;font-size:12px;
++margin-right:4px}}.badge.on{{background:#2d5;color:#111}}
++.badge.off{{background:#333;color:#999}}</style>
++</div>"""
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before6/kid_dashboard_v3.py h668_hardened/kid_dashboard_v3.py
+--- h668_before6/kid_dashboard_v3.py	2026-07-08 20:57:43.104574418 +0000
++++ h668_hardened/kid_dashboard_v3.py	2026-07-08 20:58:10.457772718 +0000
+@@ -5,6 +5,7 @@
+ from urllib.parse import parse_qs, urlparse
+ 
+ WORKDIR = Path(os.environ.get("H668_WORKDIR", "work"))
++import dash_routing  # read-only routing/auto-rotation panel logic
+ EXPECTED = int(os.environ.get("H668_WORKERS", "12"))
+ PORT = int(os.environ.get("H668_DASH_PORT", "6680"))
+ 
+@@ -659,6 +660,8 @@
+ </div>
+ 
+ <div class="section">
++{dash_routing.render_routing_html()}
++
+ <h2>Workers</h2>
+ <table>
+ <tr><th>ID</th><th>Route</th><th>State</th><th>CPU</th><th>Runtime</th><th>PID</th><th>Cycle</th><th>Latest pairs</th><th>Latest probes</th><th>Source</th><th>Updated</th><th>Cycle trend</th></tr>
+@@ -1339,6 +1342,32 @@
+         self.wfile.write(data)
+ 
+     def do_GET(self):
++        if self.path.startswith(("/rotate-status.json",
++                                 "/autorotate.json")):
++            # READ-ONLY preview of what auto-rotate WOULD do; the
++            # dashboard never rotates, starts, or stops workers.
++            data = json.dumps(
++                dash_routing.rotate_status_payload()).encode()
++            self.send_response(200)
++            self.send_header("Content-Type",
++                             "application/json; charset=utf-8")
++            self.send_header("Cache-Control", "no-store")
++            self.send_header("Content-Length", str(len(data)))
++            self.end_headers()
++            self.wfile.write(data)
++            return
++
++        if self.path.startswith("/routing.json"):
++            data = json.dumps(dash_routing.routing_payload()).encode()
++            self.send_response(200)
++            self.send_header("Content-Type",
++                             "application/json; charset=utf-8")
++            self.send_header("Cache-Control", "no-store")
++            self.send_header("Content-Length", str(len(data)))
++            self.end_headers()
++            self.wfile.write(data)
++            return
++
+         if self.path.startswith("/pools.json"):
+             data = json.dumps(pools_summary_payload()).encode()
+             self.send_response(200)
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before6/tests_dashboard.py h668_hardened/tests_dashboard.py
+--- h668_before6/tests_dashboard.py	1970-01-01 00:00:00.000000000 +0000
++++ h668_hardened/tests_dashboard.py	2026-07-08 21:00:00.713361746 +0000
+@@ -0,0 +1,198 @@
++"""Dashboard routing-panel tests. Run: python3 tests_dashboard.py"""
++import importlib
++import json
++import os
++import shutil
++import subprocess
++import sys
++import time
++
++import worker as wk
++
++PASS = 0
++PY = sys.executable
++WD = "dash_work"
++
++
++def check(name, cond):
++    global PASS
++    if not cond:
++        print(f"FAIL  {name}")
++        sys.exit(1)
++    PASS += 1
++    print(f"ok    {name}")
++
++
++def mk_worker(wid, route, seed, cycles=12, accepted=0, dup=5000,
++              status="running", phase="", eta=None, bins_at_cap=0):
++    d = os.path.join(WD, f"worker_{wid:03d}")
++    os.makedirs(d, exist_ok=True)
++    json.dump({"worker_id": wid, "route": route, "seed": seed},
++              open(os.path.join(d, "meta.json"), "w"))
++    rows = [json.dumps({"t": 0, "cycle": c + 1, "secs": 60.0,
++                        "status": "running", "pools": {"1": 500},
++                        "pool_cap": 100000, "generated": 100000,
++                        "accepted": accepted, "dup_rejected": dup,
++                        "build_psd_rej": 90000, "pairs_hashed": 10,
++                        "probes": 10, "probe_psd_rej": 0,
++                        "psd_rejected": 0, "collisions": 0,
++                        "buckets": 10}) for c in range(cycles)]
++    if rows:
++        open(os.path.join(d, "cycles.jsonl"), "w").write(
++            "\n".join(rows) + "\n")
++    lc = {"phase": phase}
++    if eta:
++        lc["eta_key_seconds"] = eta
++    wk.write_json_atomic(os.path.join(d, "progress.json"),
++                         {"route": route, "updated": time.time(),
++                          "cycle": cycles, "status": status,
++                          "bins_at_cap": bins_at_cap,
++                          "totals": {"accepted": accepted * cycles,
++                                     "dup_rejected": dup * cycles},
++                          "telemetry_started_at": time.time() - 3600,
++                          "pools": {"1": 500}, "pool_cap": 100000,
++                          "latest_cycle": lc})
++
++
++def snapshot(root):
++    out = {}
++    for base, _, files in os.walk(root):
++        for f in files:
++            p = os.path.join(base, f)
++            st = os.stat(p)
++            out[p] = (st.st_size, st.st_mtime)
++    return out
++
++
++shutil.rmtree(WD, ignore_errors=True)
++os.makedirs(WD)
++mk_worker(0, "gs", 94054011, accepted=200, dup=10,
++          status="matching", phase="matching key 3/30 block 1/4",
++          eta=5400)
++mk_worker(1, "gs", 94041003, accepted=180, dup=10)
++mk_worker(2, "gs", 20260706, accepted=0, dup=5000)   # duplicate-saturated
++mk_worker(3, "tt", 555, cycles=0, status="running")  # silent TT
++open("dash_seeds.txt", "w").write(
++    "94054011\n94041003\n94000001\n94047010\n94025015\n")
++rots = [{"timestamp": time.time() - 100, "old_worker_id": 2,
++         "old_seed": 111, "new_seed": 94000001,
++         "reason": "PROVEN STALE: test", "old_accepted_per_min": 0.0,
++         "old_dup_pct": 100.0, "old_cycle": 40}]
++open(os.path.join(WD, "seed_rotations.jsonl"), "w").write(
++    "\n".join(json.dumps(r) for r in rots) + "\n")
++
++os.environ.update(H668_WORKDIR=WD, H668_WORKERS="4",
++                  H668_SEEDS="dash_seeds.txt", H668_DASH_CACHE_TTL="0")
++sys.path.insert(0, ".")
++import dash_routing as dr
++importlib.reload(dr)
++
++# ---- 1. route mix card --------------------------------------------------------
++mix = dr.route_mix()
++check("route mix counts GS/TT/total",
++      mix["gs"]["count"] == 3 and mix["tt"]["count"] == 1
++      and mix["total"] == 4)
++check("route mix reports accepted/min by route",
++      mix["gs"]["apm"] > 300 and mix["tt"]["apm"] == 0)
++
++# ---- 2. worker table fields ---------------------------------------------------
++rows = {r["id"]: r for r in mix["workers"]}
++check("worker rows show route, seed, acc/min, dup%, bins_at_cap",
++      rows[0]["route"] == "GS" and rows[0]["seed"] == 94054011
++      and rows[0]["accepted_per_min"] > 100
++      and rows[2]["dup_pct"] == 100.0 and rows[2]["bins_at_cap"] == 0)
++check("status mapping: matching / accepting / duplicate-saturated",
++      rows[0]["status"] == "matching" and rows[1]["status"] == "accepting"
++      and rows[2]["status"] == "duplicate-saturated")
++check("phase and key ETA surfaced",
++      rows[0]["phase"].startswith("matching key")
++      and rows[0]["eta_key_seconds"] == 5400)
++
++# ---- 3. stale field always present in dashboard progress() --------------------
++import kid_dashboard_v3 as dash
++importlib.reload(dash)
++for wid in (0, 3):
++    check(f"progress() always carries a stale field (worker {wid})",
++          "stale" in dash.progress(wid))
++os.makedirs(os.path.join(WD, "worker_009"))
++check("progress() carries stale even with no telemetry at all",
++      "stale" in dash.progress(9))
++
++# ---- 4. auto-rotate pid detection ---------------------------------------------
++st = dr.autorotate_status()
++check("no pid file -> watch not running", st["watch_running"] is False)
++json.dump({"pid": os.getpid(), "cooldown_minutes": 30,
++           "started": time.time()},
++          open(os.path.join(WD, "auto_rotate.pid"), "w"))
++dr._cache.clear()
++st = dr.autorotate_status()
++check("live pid detected as watch mode active",
++      st["watch_running"] is True and st["pid"] == os.getpid()
++      and st["rotations_today"] == 1
++      and st["cooldown_remaining_seconds"] > 0
++      and "PROVEN STALE" in st["latest_reason"])
++json.dump({"pid": 99999999, "cooldown_minutes": 30},
++          open(os.path.join(WD, "auto_rotate.pid"), "w"))
++dr._cache.clear()
++check("dead pid -> watch not running",
++      dr.autorotate_status()["watch_running"] is False)
++
++# ---- 5. seed queue -------------------------------------------------------------
++sq = dr.seed_queue()
++check("seed queue counts remaining and lists next unused",
++      sq["total_in_file"] == 5 and sq["remaining"] == 2
++      and sq["next_unused"] == [94047010, 94025015])
++check("seed queue separates live-worker seeds from rotation-log seeds",
++      94054011 in sq["used_by_live_workers"]
++      and 94000001 in sq["used_in_rotation_log"])
++check("seed-low badge when fewer than 20 remain", sq["low"] is True)
++
++# ---- 6. rotation history parsing ------------------------------------------------
++hist = dr.rotation_history(10)
++check("rotation history parses all required columns",
++      len(hist) == 1 and hist[0]["worker_id"] == 2
++      and hist[0]["old_seed"] == 111 and hist[0]["new_seed"] == 94000001
++      and hist[0]["old_dup_pct"] == 100.0 and hist[0]["old_cycle"] == 40)
++
++# ---- 7. recommendation + badges + panel render ----------------------------------
++# make the duplicate-saturated worker ALIVE (hold its lock) so the
++# assessment path -- which mirrors what auto-rotate would actually do --
++# can classify it as a rotation candidate
++check("test process holds worker_002 lock (simulates alive worker)",
++      wk.acquire_worker_lock(os.path.join(WD, "worker_002")))
++dr._cache.clear()
++rec = dr.recommendation()
++check("recommendation flags stale GS candidates",
++      "GS stale candidates found" in rec and "2" in rec)
++html_out = dr.render_routing_html()
++check("routing panel renders cards, table, history, badges",
++      "Route Mix" in html_out and "Auto-Rotate" in html_out
++      and "Seed Queue" in html_out and "Rotation history" in html_out
++      and "duplicate-saturated" in html_out)
++page_html = dash.page()
++check("main dashboard page embeds the routing panel",
++      "Routing &amp; Auto-Rotation" in page_html)
++
++# ---- 8. endpoints are READ-ONLY --------------------------------------------------
++before = snapshot(WD)
++_ = dr.routing_payload()
++rs = dr.rotate_status_payload()
++_ = dr.render_routing_html()
++after = snapshot(WD)
++check("routing/rotate-status/render make ZERO filesystem changes",
++      before == after)
++check("rotate-status is an explicit read-only dry-run preview",
++      rs["read_only"] is True and "never rotates" in rs["note"]
++      and any(p["worker_id"] == 2 and "PROVEN STALE" in p["reason"]
++              for p in rs["would_rotate"]))
++check("rotate-status lists skips with reasons",
++      any(s["worker_id"] == 1 for s in rs["skips"]))
++src = open("dash_routing.py").read()
++check("dash_routing contains no write/remove/spawn calls",
++      all(tok not in src for tok in ('open(pid_path, "w"', '"w")',
++                                     "'w')", "os.remove", "os.replace",
++                                     "Popen", "os.kill(int(pid), 9")))
++
++shutil.rmtree(WD, ignore_errors=True)
++os.remove("dash_seeds.txt")
++print(f"\nALL {PASS} DASHBOARD TESTS PASSED")

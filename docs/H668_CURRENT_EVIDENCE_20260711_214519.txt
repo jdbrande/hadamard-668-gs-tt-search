@@ -1,0 +1,124 @@
+H668 current evidence
+generated: Sat Jul 11 21:45:19 CDT 2026
+
+=== proof packet ===
+-rw-r--r--  1 johnnabrandenburg  staff   7.6K Jul 11 21:44 docs/H668_MATH_PROOF_PACKET.md
+
+=== compile ===
+
+=== native build ===
+$ c++ -O3 -std=c++17 -dynamiclib -mcpu=native /Users/johnnabrandenburg/math/h668/fastmatch.cpp -o /Users/johnnabrandenburg/math/h668/libfastmatch.dylib
+built /Users/johnnabrandenburg/math/h668/libfastmatch.dylib with flags ['-dynamiclib', '-mcpu=native']
+correctness oracle passed; backend = neon
+native module ready.
+
+=== proof tests ===
+[32mok    fixture has solutions on same-bin/same-bin split ((5, 5), (1, 1))[0m
+[32mok    REPRESENTATIVE PROOF: for every exhaustive solution (i,j,k,l), the ordered representative (i<=j, k<=l) is ALSO a solution -- the matching identity is symmetric in each side's pair[0m
+[32mok    tri-restricted match finds a solution from the exhaustive set[0m
+[32mok    tri restriction actually skipped swap pairs[0m
+[32mok    tri-found solution assembles and verifies exactly (order 52)[0m
+[32mok    tri never invents matches on matchless pools[0m
+[32mok    incremental blocks with global offsets hash EXACTLY the same i<=j pairs as one unblocked pass (no pair lost, none doubled)[0m
+[32mok    python and native v6 agree: swap_skipped, psd_skipped, pairs_hashed, outcome[0m
+[32mok    GS worker (tri active on same-bin keys) still finds and verifies order 52[0m
+[32mok    GS solution verifies independently[0m
+[32mok    TT worker still finds and verifies order 44[0m
+[32mok    merge prints canonical telemetry (raw/kept/removed per route)[0m
+[32mok    orbit duplicates removed: global smaller than raw union (44 kept of 132 raw rows incl. planted orbits)[0m
+[32mok    NO ORBIT LOST: canonical key set of merged global == canonical key set of raw union, every bin[0m
+[32mok    canonical merge is idempotent (second run removes 0)[0m
+[32mok    route-safe: gs global has only gs bins, tt only tt bins[0m
+[32mok    fresh worker absorbing canonical-deduped globals still solves[0m
+[32m
+ALL 17 CANONICAL-DEDUP TESTS PASSED[0m
+[32mok    theorem: all 450 known-solution pairs satisfy the PSD cap at every frequency (so no top-K subset can reject them)[0m
+[32mok    K=4 two-sided screen: filtered solution set == complete set on every pattern/split[0m
+[32mok    TT(4) fixture: X+Y and Z+W satisfy their weighted caps at every frequency[0m
+[32mok    production matcher with K-screen agrees with exhaustive reference and matches verify exactly[0m
+[32mok    K=4 rejects at least as much as K=1 with identical match outcome[0m
+[32mok    python and native v5 screens: identical skips, pairs, and outcome[0m
+[32m
+ALL 6 SCREEN PROOF TESTS PASSED[0m
+[32mok    H668_NATIVE=0 forces python path[0m
+[32mok    default: native enabled when compiled[0m
+[32mok    backend reported[0m
+[32mok    native canon_key byte-identical to python on 1200 random cases (incl. n=1,2 edge cases)[0m
+[32mok    canon_key edge: constant sequence[0m
+[32mok    randomized oracle (8 trials incl. empty pools, h=1..99, weights): python and native find matches from the same solution set with identical pairs/probes/psd counters[0m
+[32mok    PSD-screened matching: identical psd_skipped python vs native[0m
+[32mok    v3 kernel returns members of the exhaustive solution set[0m
+[32mok    end-to-end gs solve verifies with H668_NATIVE=0[0m
+[32mok    end-to-end tt solve verifies with H668_NATIVE=0[0m
+[32mok    telemetry reports native fields (mode 0)[0m
+[32mok    resume across native<->python switch still solves (0->1)[0m
+[32mok    end-to-end gs solve verifies with H668_NATIVE=1[0m
+[32mok    end-to-end tt solve verifies with H668_NATIVE=1[0m
+[32mok    telemetry reports native fields (mode 1)[0m
+[32mok    resume across native<->python switch still solves (1->0)[0m
+[native] *** DISAGREEMENT WITH PYTHON: forced mismatch (H668_NATIVE_FORCE_MISMATCH=1) ***
+[native] native path DISABLED for this process; falling back to pure Python. Please report this.
+[32mok    forced disagreement disables native loudly with a recorded reason[0m
+[32mok    benchmark: native pair throughput >= 2x python (5,976,691 vs 1,241,231/s = 4.8x)[0m
+[32m
+ALL 18 NATIVE TESTS PASSED[0m
+[32mok    collision_log captures events; exact match (if any) is logged[0m
+[32mok    collisions.jsonl written when a match/collision occurs[0m
+[32mok    evidence record carries every required field[0m
+[32mok    evidence includes the real seed and reloadable sequences[0m
+[32mok    the solving collision has zero residual and verified=true[0m
+[32mok    progress.json now includes the real seed[0m
+[32mok    replay-collision recomputes residual and re-verifies the match[0m
+[32mok    replayed matrix passes independent exact verification[0m
+[32mok    replay-collision explains missing records honestly[0m
+[32mok    replay-cycle reconstructs the snapshot and re-finds+verifies[0m
+[32mok    replay classifies nonzero residual as hash noise, no false verify[0m
+[32mok    test holds pinned worker lock[0m
+[32mok    auto-rotate never touches PINNED workers (even proven-stale ones)[0m
+[32mok    manual rotate refuses pinned workers with clear message[0m
+[32mok    dashboard flags pinned workers and shows real seed from progress[0m
+[32mok    dashboard clue owners: worker, seed, cycle, route, verified[0m
+[32mok    clue panel renders with noise/verified distinction[0m
+[32mok    merge is route-safe: gs file has only gs bins, tt only tt bins[0m
+[32m
+ALL 18 CLUE/REPLAY TESTS PASSED[0m
+[32mok    command runs and writes work/seed_leaderboard.json[0m
+[32mok    seed with ONE residual_zero outranks seed with 60 noisy collisions and higher acc/min[0m
+[32mok    verified_hadamard outranks residual_zero[0m
+[32mok    noisy collisions capped: 60 noisy contribute <= +5 pts[0m
+[32mok    pinned clue owner marked in JSON and table[0m
+[32mok    missing collisions.jsonl handled: seed still ranked with zero evidence[0m
+[32mok    corrupt collision line skipped with a printed warning[0m
+[32mok    JSON schema stable: top-level and per-seed keys[0m
+[32mok    re-run produces identical schema and identical ranking[0m
+[32mok    per-worker summaries present with dirs[0m
+[32mok    retired worker dirs still contribute their seed's evidence[0m
+[32mok    dashboard card: top seeds with counts and near-zero-weight note[0m
+[32mok    panel renders Seed Leaderboard card with pinned marker[0m
+[32mok    routing.json payload carries seed_leaderboard (read-only)[0m
+[32m
+ALL 14 SEED-SCORE TESTS PASSED[0m
+
+=== seed leaderboard ===
+  #       seed  route     score  acc/min   dup%  verif  res0  noisy  pass%   bal  @cap  1stEv(h)  flags
+  1   94054003     gs      67.7    186.7  11.6%      0     0      0  0.26%  0.85     0         -  -
+  2   94091007     gs      66.7    184.7  11.7%      0     0      0  0.26%  0.85     0         -  PINNED(clue owner)
+  3   20260706  gs/tt    -217.9     82.3   0.0%      0     0      0  0.26%  0.54    10         -  PINNED(clue owner) CAPPED
+  4   94041004     tt    -307.0      9.4  72.7%      0     0      0  2.58%  0.39    10         -  CAPPED
+  5   94076003     tt    -307.2      9.4  72.8%      0     0      0  2.57%  0.39    10         -  CAPPED
+  6   94054007     tt    -307.2      9.3  72.8%      0     0      0  2.56%  0.39    10         -  CAPPED
+  7   94025008     tt    -307.3      9.3  72.8%      0     0      0  2.55%  0.39    10         -  CAPPED
+  8   94025003     tt    -307.3      9.3  72.8%      0     0      0  2.55%  0.39    10         -  CAPPED
+  9   94076005     tt    -307.4      9.3  73.0%      0     0      0  2.57%  0.39    10         -  CAPPED
+ 10   94076006     tt    -307.5      9.2  73.0%      0     0      0  2.54%  0.39    10         -  CAPPED
+ 11   94091011     tt    -307.6      9.2  73.0%      0     0      0  2.54%  0.39    10         -  CAPPED
+ 12   94067009     tt    -307.6      9.2  73.1%      0     0      0  2.55%  0.39    10         -  CAPPED
+ 13   94021003     tt    -307.8      9.2  73.2%      0     0      0  2.55%  0.39    10         -  CAPPED
+
+written: work/seed_leaderboard.json (13 seeds, 36 workers incl. retired)
+note: raw noisy collisions are capped at +5.0 pts total; only residual_zero/verified evidence can dominate the ranking.
+
+=== route mix ===
+
+=== worker 004 ===
+-rw-r--r--  1 johnnabrandenburg  staff  0 Jul 11 21:12 work/worker_004/PIN

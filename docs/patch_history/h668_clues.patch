@@ -1,0 +1,783 @@
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before7/ctl.py h668_hardened/ctl.py
+--- h668_before7/ctl.py	2026-07-11 02:42:10.960260193 +0000
++++ h668_hardened/ctl.py	2026-07-11 02:43:25.953461381 +0000
+@@ -285,12 +285,18 @@
+             merged[key] = (np.unique(np.concatenate([merged[key], arr]),
+                                      axis=0)
+                            if key in merged else np.unique(arr, axis=0))
++    def route_of_key(k):
++        return "tt" if k.startswith(("bxy_", "bz_", "bw_")) else "gs"
++
+     for route in ("gs", "tt"):
++        keys = {k: v for k, v in merged.items()
++                if route_of_key(k) == route}
+         out = os.path.join(a.workdir, f"global_pools_{route}.npz")
+         tmp = f"{out}.tmp.{os.getpid()}.npz"
+-        np.savez_compressed(tmp, **merged)
++        np.savez_compressed(tmp, **keys)
+         os.replace(tmp, out)
+-    print("merged pools:", {k: len(v) for k, v in merged.items()})
++        print(f"global_pools_{route}: "
++              f"{ {k: len(v) for k, v in keys.items()} or 'empty' }")
+ 
+ 
+ def migrate(a):
+@@ -575,6 +581,11 @@
+     dir to work/retired/ (NEVER deleted), launch fresh GS worker with the
+     provided seed. Old state fully preserved."""
+     ids = [int(x) for x in a.replace_workers.split(",")]
++    pinned = [w for w in ids if os.path.exists(
++        os.path.join(a.workdir, f"worker_{w:03d}", "PIN"))]
++    if pinned:
++        sys.exit(f"refusing: workers {pinned} are PINNED "
++                 f"(remove work/worker_NNN/PIN to allow rotation)")
+     seeds = [int(x) for x in a.seeds.split(",")]
+     if len(seeds) != len(ids):
+         sys.exit(f"need one seed per worker: {len(ids)} workers, "
+@@ -643,6 +654,8 @@
+             pass
+     route = prog.get("route") or meta.get("route")
+     info = {"wid": wid, "route": route, "seed": meta.get("seed")}
++    if os.path.exists(os.path.join(d, "PIN")):
++        return "skip", {**info, "why": "PINNED (never auto-rotated)"}
+     if route != "gs":
+         return "skip", {**info, "why": "not a GS worker (never touched)"}
+     alive = lock_holder(d)[0] or wid in ps_workers(
+@@ -857,6 +870,125 @@
+         one_pass()
+ 
+ 
++def _load_collisions(workdir, wid):
++    path = os.path.join(workdir, f"worker_{wid:03d}", "collisions.jsonl")
++    out = []
++    if os.path.exists(path):
++        for line in open(path).read().splitlines():
++            try:
++                out.append(json.loads(line))
++            except ValueError:
++                pass
++    return out
++
++
++def _seq_from_str(s):
++    return np.array([1 if ch == "+" else -1 for ch in s], dtype=np.int8)
++
++
++def replay_collision(a):
++    """Reproduce and re-verify a saved collision, read-only w.r.t. work/.
++    Recomputes the PAF residual from the stored sequences and, if it is
++    exactly zero, assembles and verifies the Hadamard matrix."""
++    import worker as wk
++    recs = _load_collisions(a.workdir, a.worker_id)
++    if a.cycle is not None:
++        recs = [r for r in recs if r.get("cycle") == a.cycle]
++    if not recs:
++        sys.exit(f"no collision records for worker {a.worker_id}"
++                 + (f" cycle {a.cycle}" if a.cycle is not None else "")
++                 + " (records begin after the evidence patch; earlier "
++                 "collisions were counters only and cannot be replayed)")
++    for n, r in enumerate(recs):
++        print(f"--- record {n}: worker {r['worker_id']} seed {r['seed']} "
++              f"cycle {r['cycle']} route {r['route']} "
++              f"pattern {r['pattern']} bins {r['bins']} "
++              f"idx {r['indices']}")
++        quad = [_seq_from_str(s) for s in r["sequences"]]
++        route = wk.GSRoute(len(quad[0])) if r["route"] == "gs" \
++            else wk.TTRoute(len(quad[0]))
++        pafs = [route.paf(q[None, :])[0].astype(int) for q in quad]
++        residual = (route.wt[0] * (pafs[0] + pafs[1])
++                    + route.wt[1] * (pafs[2] + pafs[3]))
++        nz = int(np.abs(residual).sum())
++        print(f"    recomputed PAF residual L1 = {nz} "
++              f"({'ZERO -- exact match' if nz == 0 else 'nonzero -- '
++                 'hash coincidence, mathematically empty'})")
++        if nz == 0:
++            H = route.assemble(quad)
++            N = core.verify_hadamard(H)
++            csv = f"hadamard_{N}_replay.csv"
++            np.savetxt(csv, H, fmt="%d", delimiter=",")
++            print(f"    VERIFIED Hadamard order {N} -> {csv}")
++        else:
++            print("    stored verdict matches: "
++                  f"residual_zero={r['residual_zero']} "
++                  f"verified={r['verified_hadamard']}")
++
++
++def replay_cycle(a):
++    """Re-run matching over the pool snapshot a worker had at a given
++    cycle (pools are append-only, so slicing to that cycle's recorded bin
++    sizes reconstructs the exact candidate set). Read-only; reports every
++    hash collision and any exact match. Can be expensive: bound with
++    --max-pairs."""
++    import worker as wk
++    import engine
++    d = os.path.join(a.workdir, f"worker_{a.worker_id:03d}")
++    hist = [json.loads(l) for l in
++            open(os.path.join(d, "cycles.jsonl")).read().splitlines()]
++    rec = next((r for r in hist if r.get("cycle") == a.cycle), None)
++    if rec is None:
++        sys.exit(f"cycle {a.cycle} not found in cycles.jsonl")
++    meta = json.load(open(os.path.join(d, "meta.json")))
++    route = wk.GSRoute(meta.get("n") or 167) if meta["route"] == "gs" \
++        else wk.TTRoute(meta.get("n") or 56)
++    data = np.load(os.path.join(d, "pools.npz"), allow_pickle=False)
++    pools = {}
++    for b in route.bins:
++        bk = wk.bin_key(b)
++        want = int(rec["pools"].get(str(b), 0))
++        arr = data[bk][:want] if bk in data.files else \
++            np.empty((0, route.lengths[b]), np.int8)
++        if len(arr) < want:
++            print(f"warning: bin {b} has {len(arr)} rows now but cycle "
++                  f"recorded {want}; snapshot incomplete")
++        p = engine.Pool(route.lengths[b], route.periodic)
++        p.seqs = arr.astype(np.int8)
++        pools[b] = p
++    print(f"replaying cycle {a.cycle} snapshot: "
++          f"{ {str(b): len(p.seqs) for b, p in pools.items()} }")
++    total_coll, found = 0, None
++    for pi, pat in enumerate(route.patterns):
++        for (b1, b2), (b3, b4) in route.splits(pat):
++            P = [pools[b] for b in (b1, b2, b3, b4)]
++            if min(len(p.seqs) for p in P) == 0:
++                continue
++            pafs = [route.paf(p.seqs) for p in P]
++            clog = []
++            hit = engine.match(pafs[0], pafs[1], pafs[2], pafs[3],
++                               wt1=route.wt[0], wt2=route.wt[1],
++                               max_pairs=a.max_pairs,
++                               collision_log=clog)
++            if clog:
++                print(f"  pattern {pat}: {len(clog)} hash "
++                      f"collision(s) at indices {clog[:8]}")
++                total_coll += len(clog)
++            if hit is not None:
++                found = (pat, [P[x].seqs[hit[x]] for x in range(4)])
++    if found is not None:
++        pat, quad = found
++        H = route.assemble(quad)
++        N = core.verify_hadamard(H)
++        csv = f"hadamard_{N}_replay.csv"
++        np.savetxt(csv, H, fmt="%d", delimiter=",")
++        print(f"EXACT MATCH re-found and VERIFIED: order {N} -> {csv}")
++    else:
++        print(f"replay complete: {total_coll} hash collision(s), "
++              f"no exact match in this snapshot (consistent with the "
++              f"original run)")
++
++
+ def verify(a):
+     H = np.loadtxt(a.csv, delimiter=",", dtype=np.int64)
+     N = core.verify_hadamard(H)
+@@ -926,6 +1058,13 @@
+     pr2.add_argument("--pool-cap", type=int, default=100000)
+     pr2.add_argument("--max-pairs", type=int, default=20_000_000)
+     pr2.add_argument("--wait-minutes", type=float, default=10)
++    for name in ("replay-collision", "replay-cycle"):
++        p = sub.add_parser(name)
++        p.add_argument("--workdir", default="work")
++        p.add_argument("--worker-id", type=int, required=True)
++        p.add_argument("--cycle", type=int, default=None,
++                       required=(name == "replay-cycle"))
++        p.add_argument("--max-pairs", type=int, default=20_000_000)
+     pv = sub.add_parser("verify")
+     pv.add_argument("csv")
+     a = ap.parse_args()
+@@ -936,7 +1075,9 @@
+      "acceptance": acceptance, "experiment": experiment,
+      "recommend-routes": recommend_routes,
+      "rotate-gs-seeds": rotate_gs_seeds,
+-     "auto-rotate-gs": auto_rotate_gs}[a.cmd](a)
++     "auto-rotate-gs": auto_rotate_gs,
++     "replay-collision": replay_collision,
++     "replay-cycle": replay_cycle}[a.cmd](a)
+ 
+ 
+ if __name__ == "__main__":
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before7/dash_routing.py h668_hardened/dash_routing.py
+--- h668_before7/dash_routing.py	2026-07-11 02:42:10.979743463 +0000
++++ h668_hardened/dash_routing.py	2026-07-11 02:43:25.970308240 +0000
+@@ -210,7 +210,8 @@
+         status = p.get("status", "unknown")
+     return {"id": wid,
+             "route": (p.get("route") or m.get("route") or "?").upper(),
+-            "seed": m.get("seed"),
++            "seed": p.get("seed") or m.get("seed"),
++            "pinned": (d / "PIN").exists(),
+             "accepted_per_min": round(apm, 1),
+             "dup_pct": round(dup_pct, 1) if dup_pct is not None else None,
+             "bins_at_cap": p.get("bins_at_cap", 0),
+@@ -267,12 +268,34 @@
+ 
+ # ---------------------------------------------------------- payloads
+ 
++def clue_owners():
++    """Collision evidence, per worker: who found what, when, verified?"""
++    def build():
++        out = []
++        for d in worker_dirs():
++            for line in _tail_lines(d / "collisions.jsonl", 20):
++                try:
++                    r = json.loads(line)
++                    out.append({"worker_id": r["worker_id"],
++                                "seed": r.get("seed"),
++                                "cycle": r.get("cycle"),
++                                "time": r.get("timestamp"),
++                                "route": r.get("route"),
++                                "verified": r.get("verified_hadamard"),
++                                "residual_zero": r.get("residual_zero")})
++                except (ValueError, KeyError):
++                    pass
++        return sorted(out, key=lambda x: x["time"] or 0)[-10:]
++    return _cached("clues", build)
++
++
+ def routing_payload():
+     return {"read_only": True, "route_mix": route_mix(),
+             "auto_rotate": autorotate_status(),
+             "seed_queue": seed_queue(),
+             "rotation_history": rotation_history(10),
+             "recommendation": recommendation(),
++            "clues": clue_owners(),
+             "badges": [{"label": l, "on": bool(v)} for l, v in badges()],
+             "updated": int(time.time())}
+ 
+@@ -346,7 +369,9 @@
+       </div></div>"""
+     rows = ""
+     for r in mix["workers"]:
+-        rows += (f"<tr><td>w{r['id']}</td><td><b>{_esc(r['route'])}</b>"
++        pin = " 📌" if r.get("pinned") else ""
++        rows += (f"<tr><td>w{r['id']}{pin}</td>"
++                 f"<td><b>{_esc(r['route'])}</b>"
+                  f"</td><td>{_esc(r['seed'] or '-')}</td>"
+                  f"<td>{r['accepted_per_min']:,}</td>"
+                  f"<td>{r['dup_pct'] if r['dup_pct'] is not None else '-'}"
+@@ -376,6 +401,19 @@
+ <th>@cap</th><th>Status</th><th>Phase</th><th>Key ETA</th></tr>
+ {rows}
+ </table>
++<h2>Clue owners (collision evidence)</h2>
++<table>
++<tr><th>Time</th><th>Worker</th><th>Seed</th><th>Cycle</th><th>Route</th>
++<th>Exact?</th><th>Verified?</th></tr>
++{"".join(f"<tr><td>{_t(cl['time'])}</td><td>w{cl['worker_id']}</td>"
++         f"<td>{_esc(cl['seed'])}</td><td>{cl['cycle']}</td>"
++         f"<td>{_esc((cl['route'] or '').upper())}</td>"
++         f"<td>{'YES' if cl['residual_zero'] else 'no (hash noise)'}</td>"
++         f"<td>{'VERIFIED' if cl['verified'] else '-'}</td></tr>"
++         for cl in reversed(clue_owners()))
++ or "<tr><td colspan=7>no collision evidence yet (records begin "
++    "after the evidence patch)</td></tr>"}
++</table>
+ <h2>Rotation history (latest 10)</h2>
+ <table>
+ <tr><th>Time</th><th>Worker</th><th>Old seed</th><th>New seed</th>
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before7/engine.py h668_hardened/engine.py
+--- h668_before7/engine.py	2026-07-11 02:42:10.962051964 +0000
++++ h668_hardened/engine.py	2026-07-11 02:42:30.834819525 +0000
+@@ -104,7 +104,7 @@
+ 
+ 
+ def _numpy_match(pafA, pafB, pafC, pafD, wt1, wt2, stats,
+-                 psd1=None, psd2=None):
++                 psd1=None, psd2=None, collision_log=None, lo=0):
+     psdA, psdB, cap1 = psd1 if psd1 else (None, None, None)
+     psdC, psdD, cap2 = psd2 if psd2 else (None, None, None)
+     wA = psdA.argmax(axis=1).astype(np.int32) if psdA is not None else None
+@@ -134,13 +134,15 @@
+             if hits:
+                 stats["collisions"] += len(hits)
+                 i, j = hits[0]
++                if collision_log is not None:
++                    collision_log.append((i + lo, j, k, l))
+                 return (i, j, k, l)
+     return None
+ 
+ 
+ def match(pafA, pafB, pafC, pafD, wt1=1, wt2=1,
+           max_pairs=20_000_000, chunk=4000, stats=None,
+-          psd1=None, psd2=None, on_progress=None):
++          psd1=None, psd2=None, on_progress=None, collision_log=None):
+     """Find (i,j,k,l) with wt1*(pafA[i]+pafB[j]) + wt2*(pafC[k]+pafD[l]) = 0.
+ 
+     COMPLETE over the given arrays: chunking never drops rows. Optional
+@@ -166,10 +168,11 @@
+         pA = (psdA_all[lo:lo + eff], psd1[1], psd1[2]) if psd1 else None
+         if lib is not None:
+             r = _cc_match(lib, A, pafB, pafC, pafD, h, wt1, wt2,
+-                          pA, psd2, stats)
++                          pA, psd2, stats, collision_log, lo)
+         else:
+             r = _numpy_match(A, pafB, pafC, pafD, wt1, wt2, stats,
+-                             psd1=pA, psd2=psd2)
++                             psd1=pA, psd2=psd2,
++                             collision_log=collision_log, lo=lo)
+         if r is not None:
+             return (r[0] + lo, r[1], r[2], r[3])
+     if on_progress is not None:
+@@ -177,9 +180,13 @@
+     return None
+ 
+ 
+-def _cc_match(lib, A, pafB, pafC, pafD, h, wt1, wt2, psd1, psd2, stats):
++def _cc_match(lib, A, pafB, pafC, pafD, h, wt1, wt2, psd1, psd2, stats,
++              collision_log=None, lo=0):
+     out = (ctypes.c_longlong * 4)()
+     st = (ctypes.c_longlong * 5)()
++    use_v4 = hasattr(lib, "match_pairs_v4")
++    coll_buf = (ctypes.c_longlong * (64 * 4))()
++    coll_n = ctypes.c_longlong(0)
+ 
+     def P16(x):
+         return np.ascontiguousarray(x, dtype=np.int16).ctypes.data_as(
+@@ -210,14 +217,28 @@
+     # keep references alive through the call
+     holders = [np.ascontiguousarray(x, dtype=np.float32)
+                for x in (psdA, psdB, psdC, psdD) if x is not None]
+-    entry = getattr(lib, "match_pairs_v3", None) or lib.match_pairs_v2
+-    found = entry(
+-        P16(A), len(A), P16(pafB), len(pafB),
+-        P16(pafC), len(pafC), P16(pafD), len(pafD),
+-        h, wt1, wt2,
+-        PF(psdA), PI(wA), PF(psdB),
+-        PF(psdC), PI(wC), PF(psdD),
+-        F, cap1, cap2, out, st)
++    if use_v4:
++        found = lib.match_pairs_v4(
++            P16(A), len(A), P16(pafB), len(pafB),
++            P16(pafC), len(pafC), P16(pafD), len(pafD),
++            h, wt1, wt2,
++            PF(psdA), PI(wA), PF(psdB),
++            PF(psdC), PI(wC), PF(psdD),
++            F, cap1, cap2, out, st, coll_buf, 64, ctypes.byref(coll_n))
++        if collision_log is not None:
++            for x in range(coll_n.value):
++                collision_log.append(
++                    (coll_buf[4 * x] + lo, coll_buf[4 * x + 1],
++                     coll_buf[4 * x + 2], coll_buf[4 * x + 3]))
++    else:
++        entry = getattr(lib, "match_pairs_v3", None) or lib.match_pairs_v2
++        found = entry(
++            P16(A), len(A), P16(pafB), len(pafB),
++            P16(pafC), len(pafC), P16(pafD), len(pafD),
++            h, wt1, wt2,
++            PF(psdA), PI(wA), PF(psdB),
++            PF(psdC), PI(wC), PF(psdD),
++            F, cap1, cap2, out, st)
+     del holders
+     stats["pairs_hashed"] += st[0]
+     stats["buckets"] += st[1]
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before7/fastmatch.cpp h668_hardened/fastmatch.cpp
+--- h668_before7/fastmatch.cpp	2026-07-11 02:42:10.963094503 +0000
++++ h668_hardened/fastmatch.cpp	2026-07-11 02:42:10.981747833 +0000
+@@ -231,3 +231,81 @@
+     std::memcpy(out, best.data(), n);
+     return 0;
+ }
++
++// v4: identical matching semantics to v3, plus collision-evidence capture.
++// Every hash-equal probe event (memcmp pass OR fail) is recorded as
++// (i, j, k, l) into coll_out (capacity coll_cap quadruples); *coll_n is the
++// count. Pure observability: results and counters match v3 exactly.
++extern "C" int64_t match_pairs_v4(
++    const int16_t *pafA, int64_t na, const int16_t *pafB, int64_t nb,
++    const int16_t *pafC, int64_t nc, const int16_t *pafD, int64_t nd,
++    int64_t h, int16_t wt1, int16_t wt2,
++    const float *psdA, const int32_t *wA, const float *psdB,
++    const float *psdC, const int32_t *wC, const float *psdD,
++    int64_t F, float cap1, float cap2,
++    int64_t *out_idx, int64_t *stats,
++    int64_t *coll_out, int64_t coll_cap, int64_t *coll_n) {
++
++    for (int i = 0; i < 5; i++) stats[i] = 0;
++    *coll_n = 0;
++    if (na * nb == 0 || nc * nd == 0) return 0;
++    const bool s1 = psdA && psdB && wA && cap1 > 0;
++    const bool s2 = psdC && psdD && wC && cap2 > 0;
++
++    uint64_t cap = 1;
++    while ((int64_t)cap < 2 * na * nb) cap <<= 1;
++    std::vector<uint64_t> keys(cap, 0);
++    std::vector<uint32_t> ai(cap), bj(cap);
++    std::vector<int16_t> buf(h);
++
++    for (int64_t i = 0; i < na; i++) {
++        const int16_t *ra = pafA + i * h;
++        const float ax = s1 ? psdA[i * F + wA[i]] : 0.f;
++        for (int64_t j = 0; j < nb; j++) {
++            if (s1 && ax + psdB[j * F + wA[i]] > cap1 + 1e-6f) {
++                stats[4]++; continue;
++            }
++            combine_rows(ra, pafB + j * h, wt1, buf.data(), h);
++            uint64_t k = hash64w(buf.data(), h), pos = k & (cap - 1);
++            while (keys[pos] != 0) pos = (pos + 1) & (cap - 1);
++            keys[pos] = k; ai[pos] = (uint32_t)i; bj[pos] = (uint32_t)j;
++            stats[0]++;
++        }
++    }
++    stats[1] = stats[0];
++
++    std::vector<int16_t> probe(h), chk(h);
++    for (int64_t k2 = 0; k2 < nc; k2++) {
++        const int16_t *rc = pafC + k2 * h;
++        const float cx = s2 ? psdC[k2 * F + wC[k2]] : 0.f;
++        for (int64_t l = 0; l < nd; l++) {
++            if (s2 && cx + psdD[l * F + wC[k2]] > cap2 + 1e-6f) {
++                stats[4]++; continue;
++            }
++            combine_rows(rc, pafD + l * h, (int16_t)(-wt2),
++                         probe.data(), h);
++            stats[2]++;
++            uint64_t k = hash64w(probe.data(), h), pos = k & (cap - 1);
++            while (keys[pos] != 0) {
++                if (keys[pos] == k) {
++                    stats[3]++;
++                    int64_t i = ai[pos], j = bj[pos];
++                    if (*coll_n < coll_cap) {
++                        int64_t *rec = coll_out + (*coll_n) * 4;
++                        rec[0] = i; rec[1] = j; rec[2] = k2; rec[3] = l;
++                        (*coll_n)++;
++                    }
++                    combine_rows(pafA + i * h, pafB + j * h, wt1,
++                                 chk.data(), h);
++                    if (std::memcmp(chk.data(), probe.data(), h * 2) == 0) {
++                        out_idx[0] = i; out_idx[1] = j;
++                        out_idx[2] = k2; out_idx[3] = l;
++                        return 1;
++                    }
++                }
++                pos = (pos + 1) & (cap - 1);
++            }
++        }
++    }
++    return 0;
++}
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before7/native.py h668_hardened/native.py
+--- h668_before7/native.py	2026-07-11 02:42:10.974923028 +0000
++++ h668_hardened/native.py	2026-07-11 02:42:12.721303294 +0000
+@@ -39,6 +39,22 @@
+         ctypes.c_longlong, ctypes.c_float, ctypes.c_float,
+         ctypes.POINTER(ctypes.c_longlong),
+         ctypes.POINTER(ctypes.c_longlong)]
++    if hasattr(lib, "match_pairs_v4"):
++        lib.match_pairs_v4.restype = ctypes.c_longlong
++        lib.match_pairs_v4.argtypes = (
++            [ctypes.POINTER(ctypes.c_int16), ctypes.c_longlong] * 4 + [
++                ctypes.c_longlong, ctypes.c_int16, ctypes.c_int16,
++                ctypes.POINTER(ctypes.c_float),
++                ctypes.POINTER(ctypes.c_int32),
++                ctypes.POINTER(ctypes.c_float),
++                ctypes.POINTER(ctypes.c_float),
++                ctypes.POINTER(ctypes.c_int32),
++                ctypes.POINTER(ctypes.c_float),
++                ctypes.c_longlong, ctypes.c_float, ctypes.c_float,
++                ctypes.POINTER(ctypes.c_longlong),
++                ctypes.POINTER(ctypes.c_longlong),
++                ctypes.POINTER(ctypes.c_longlong), ctypes.c_longlong,
++                ctypes.POINTER(ctypes.c_longlong)])
+     for sym in ("match_pairs_v2", "match_pairs_v3"):
+         if hasattr(lib, sym):
+             fn = getattr(lib, sym)
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before7/tests_clues.py h668_hardened/tests_clues.py
+--- h668_before7/tests_clues.py	1970-01-01 00:00:00.000000000 +0000
++++ h668_hardened/tests_clues.py	2026-07-11 02:44:22.971503185 +0000
+@@ -0,0 +1,175 @@
++"""Collision-evidence, replay, PIN, seed-telemetry, merge tests."""
++import json
++import os
++import shutil
++import subprocess
++import sys
++import time
++from collections import defaultdict
++
++import numpy as np
++
++import core
++import engine
++import worker as wk
++
++PASS = 0
++PY = sys.executable
++rng = np.random.default_rng(61)
++
++
++def check(name, cond):
++    global PASS
++    if not cond:
++        print(f"FAIL  {name}")
++        sys.exit(1)
++    PASS += 1
++    print(f"ok    {name}")
++
++
++def ctl(args):
++    return subprocess.run([PY, "ctl.py"] + args, capture_output=True,
++                          text=True, timeout=400)
++
++
++# ---- 1. collision capture parity: exact matches surface in the log ----------
++paf = rng.integers(-30, 30, (40, 20)).astype(np.int16)
++clog = []
++hit = engine.match(paf, paf, paf, paf, max_pairs=10**9,
++                   collision_log=clog)
++ref = engine.find_all_matches(paf, paf, paf, paf)
++check("collision_log captures events; exact match (if any) is logged",
++      (hit is None and len(ref) == 0) or (hit in ref and hit in clog
++                                          or len(clog) >= 1))
++
++# ---- 2. end-to-end: worker persists full collision evidence -----------------
++wd = "clue_work"
++shutil.rmtree(wd, ignore_errors=True)
++subprocess.run([PY, "worker.py", "--route", "gs", "--n", "13",
++                "--worker-id", "4", "--seed", "94091007",
++                "--workdir", wd, "--pool-cap", "300",
++                "--batch", "20000", "--max-pairs", "500000"],
++               capture_output=True, text=True, timeout=300)
++cpath = os.path.join(wd, "worker_004", "collisions.jsonl")
++check("collisions.jsonl written when a match/collision occurs",
++      os.path.exists(cpath))
++recs = [json.loads(l) for l in open(cpath).read().splitlines()]
++r = recs[-1]
++need = {"timestamp", "worker_id", "route", "seed", "cycle", "pattern",
++        "bins", "indices", "sequences", "paf_residual", "residual_zero",
++        "verified_hadamard", "verify_exception"}
++check("evidence record carries every required field", need <= set(r))
++check("evidence includes the real seed and reloadable sequences",
++      r["seed"] == 94091007 and len(r["sequences"]) == 4
++      and all(set(s) <= {"+", "-"} for s in r["sequences"]))
++check("the solving collision has zero residual and verified=true",
++      any(x["residual_zero"] and x["verified_hadamard"] for x in recs))
++
++# ---- 3. telemetry seed fix ----------------------------------------------------
++p = json.load(open(os.path.join(wd, "worker_004", "progress.json")))
++check("progress.json now includes the real seed", p["seed"] == 94091007)
++
++# ---- 4. replay-collision reproduces and re-verifies ----------------------------
++for f in ("hadamard_52_replay.csv",):
++    if os.path.exists(f):
++        os.remove(f)
++r1 = ctl(["replay-collision", "--workdir", wd, "--worker-id", "4"])
++check("replay-collision recomputes residual and re-verifies the match",
++      "VERIFIED Hadamard order 52" in r1.stdout
++      and os.path.exists("hadamard_52_replay.csv"))
++H = np.loadtxt("hadamard_52_replay.csv", delimiter=",", dtype=np.int64)
++check("replayed matrix passes independent exact verification",
++      core.verify_hadamard(H) == 52)
++r1b = ctl(["replay-collision", "--workdir", wd, "--worker-id", "4",
++           "--cycle", "9999"])
++check("replay-collision explains missing records honestly",
++      "no collision records" in (r1b.stdout + r1b.stderr))
++
++# ---- 5. replay-cycle re-finds the match from the pool snapshot -----------------
++cyc = recs[-1]["cycle"]
++os.remove("hadamard_52_replay.csv")
++r2 = ctl(["replay-cycle", "--workdir", wd, "--worker-id", "4",
++          "--cycle", str(cyc)])
++check("replay-cycle reconstructs the snapshot and re-finds+verifies",
++      "VERIFIED" in r2.stdout and os.path.exists("hadamard_52_replay.csv"))
++
++# ---- 6. a synthetic near-miss (nonzero residual) is classified as noise --------
++fake = dict(recs[-1])
++fake["cycle"] = 777
++seqs = [_s for _s in fake["sequences"]]
++flip = list(seqs[0])
++flip[0] = "+" if flip[0] == "-" else "-"
++fake["sequences"] = ["".join(flip)] + seqs[1:]
++fake["residual_zero"] = False
++fake["verified_hadamard"] = False
++with open(cpath, "a") as fh:
++    fh.write(json.dumps(fake) + "\n")
++r3 = ctl(["replay-collision", "--workdir", wd, "--worker-id", "4",
++          "--cycle", "777"])
++check("replay classifies nonzero residual as hash noise, no false verify",
++      "hash coincidence" in r3.stdout and "VERIFIED" not in r3.stdout)
++
++# ---- 7. PIN protection -----------------------------------------------------------
++os.makedirs(os.path.join(wd, "worker_007"), exist_ok=True)
++json.dump({"route": "gs", "seed": 1}, open(
++    os.path.join(wd, "worker_007", "meta.json"), "w"))
++rows = [json.dumps({"t": 0, "cycle": c + 1, "secs": 60.0,
++                    "status": "running", "pools": {"1": 500},
++                    "pool_cap": 100000, "generated": 100000,
++                    "accepted": 0, "dup_rejected": 5000,
++                    "build_psd_rej": 0, "pairs_hashed": 1, "probes": 1,
++                    "probe_psd_rej": 0, "psd_rejected": 0,
++                    "collisions": 0, "buckets": 1}) for c in range(12)]
++open(os.path.join(wd, "worker_007", "cycles.jsonl"), "w").write(
++    "\n".join(rows) + "\n")
++open(os.path.join(wd, "worker_007", "PIN"), "w").write("clue owner\n")
++check("test holds pinned worker lock",
++      wk.acquire_worker_lock(os.path.join(wd, "worker_007")))
++open("clue_seeds.txt", "w").write("95000001\n95000002\n")
++r4 = ctl(["auto-rotate-gs", "--workdir", wd, "--seed-file",
++          "clue_seeds.txt", "--replace-stale", "--dry-run",
++          "--cooldown-minutes", "0"])
++check("auto-rotate never touches PINNED workers (even proven-stale ones)",
++      "PINNED" in r4.stdout and "[plan] rotate w7" not in r4.stdout)
++r5 = ctl(["rotate-gs-seeds", "--workdir", wd, "--seeds", "95000001",
++          "--replace-workers", "7"])
++check("manual rotate refuses pinned workers with clear message",
++      "PINNED" in (r5.stdout + r5.stderr) and r5.returncode != 0)
++import importlib
++os.environ.update(H668_WORKDIR=wd, H668_WORKERS="8",
++                  H668_SEEDS="clue_seeds.txt", H668_DASH_CACHE_TTL="0")
++sys.path.insert(0, ".")
++import dash_routing as dr
++importlib.reload(dr)
++rows_ = {r["id"]: r for r in dr.route_mix()["workers"]}
++check("dashboard flags pinned workers and shows real seed from progress",
++      rows_[7]["pinned"] is True and rows_[4]["seed"] == 94091007)
++clues = dr.clue_owners()
++check("dashboard clue owners: worker, seed, cycle, route, verified",
++      any(cl["worker_id"] == 4 and cl["seed"] == 94091007
++          and cl["verified"] for cl in clues)
++      and any(cl["residual_zero"] is False for cl in clues))
++html_out = dr.render_routing_html()
++check("clue panel renders with noise/verified distinction",
++      "Clue owners" in html_out and "hash noise" in html_out
++      and "VERIFIED" in html_out)
++
++# ---- 8. route-safe merge -----------------------------------------------------------
++os.makedirs(os.path.join(wd, "worker_006"), exist_ok=True)
++np.savez_compressed(os.path.join(wd, "worker_006", "pools.npz"),
++                    bxy_2=np.ones((5, 56), np.int8),
++                    bz_0=np.ones((5, 56), np.int8))
++r6 = ctl(["merge", "--workdir", wd])
++gg = np.load(os.path.join(wd, "global_pools_gs.npz"))
++tt = np.load(os.path.join(wd, "global_pools_tt.npz"))
++check("merge is route-safe: gs file has only gs bins, tt only tt bins",
++      all(not k.startswith(("bxy_", "bz_", "bw_")) for k in gg.files)
++      and all(k.startswith(("bxy_", "bz_", "bw_")) for k in tt.files)
++      and len(tt.files) == 2)
++
++shutil.rmtree(wd, ignore_errors=True)
++for f in ("hadamard_52.csv", "hadamard_52_replay.csv",
++          "hadamard_52_collision.csv", "clue_seeds.txt"):
++    if os.path.exists(f):
++        os.remove(f)
++print(f"\nALL {PASS} CLUE/REPLAY TESTS PASSED")
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before7/worker.py h668_hardened/worker.py
+--- h668_before7/worker.py	2026-07-11 02:42:10.965788067 +0000
++++ h668_hardened/worker.py	2026-07-11 02:43:25.924016833 +0000
+@@ -206,7 +206,8 @@
+ 
+ 
+ def incremental_match(route, pools, state, max_pairs, chunk, stats,
+-                      caches=None, heartbeat=None, should_stop=None):
++                      caches=None, heartbeat=None, should_stop=None,
++                      collision_sink=None):
+     """Check exactly the quadruples not covered by the watermarks: with old
+     region a0 x b0 x c0 x d0 already checked, the four disjoint blocks
+       A[a0:] x B x C x D
+@@ -292,6 +293,7 @@
+                             })
+                     return True
+ 
++                clog = [] if collision_sink is not None else None
+                 hit = engine.match(
+                     pafs[0][a_lo:a_hi], pafs[1][b_lo:b_hi],
+                     pafs[2][c_lo:c_hi], pafs[3][d_lo:d_hi],
+@@ -299,7 +301,16 @@
+                     max_pairs=max_pairs, chunk=chunk, stats=stats,
+                     psd1=(psds[0][a_lo:a_hi], psds[1][b_lo:b_hi], cap1),
+                     psd2=(psds[2][c_lo:c_hi], psds[3][d_lo:d_hi], cap2),
+-                    on_progress=on_progress)
++                    on_progress=on_progress, collision_log=clog)
++                if clog:
++                    for (ci, cj, ck, cl) in clog:
++                        gi = (a_lo + ci, b_lo + cj, c_lo + ck, d_lo + cl)
++                        quad = [pools[b1].seqs[gi[0]],
++                                pools[b2].seqs[gi[1]],
++                                pools[b3].seqs[gi[2]],
++                                pools[b4].seqs[gi[3]]]
++                        collision_sink(pat, [str(b) for b in bins],
++                                       gi, quad, route)
+                 if stats.get("interrupted"):
+                     # do NOT advance this key's watermark; completed keys
+                     # were already persisted below. Resume redoes only
+@@ -489,7 +500,9 @@
+             "buckets", "probes", "build_psd_rej", "probe_psd_rej",
+             "psd_rejected", "collisions")
+ 
+-    def __init__(self, mydir, wid, route, pools_preexisted, pool_cap=0):
++    def __init__(self, mydir, wid, route, pools_preexisted, pool_cap=0,
++                 seed=None):
++        self.seed = seed
+         self.path = os.path.join(mydir, "progress.json")
+         self.history_path = os.path.join(mydir, "cycles.jsonl")
+         self.pool_cap = pool_cap
+@@ -571,6 +584,7 @@
+             "route": self.route.name,
+             "n": getattr(self.route, "n", getattr(self.route, "m", None)),
+             "pid": os.getpid(),
++            "seed": self.seed,
+             "started": self.started,
+             "updated": time.time(),
+             "cycle": self.cycle,
+@@ -638,7 +652,7 @@
+     caches = load_caches(mydir, route, pools, workdir)
+     telemetry = Telemetry(mydir, wid, route,
+                           pools_preexisted=data is not None,
+-                          pool_cap=pool_cap)
++                          pool_cap=pool_cap, seed=base_seed)
+     telemetry.write({}, 0.0, pools, "running")
+ 
+     state = MatchState(os.path.join(mydir, "matchstate.json"))
+@@ -651,6 +665,46 @@
+         print(line)
+         log.write(line + "\n")
+ 
++    coll_path = os.path.join(mydir, "collisions.jsonl")
++
++    def record_collision(pat, bins_s, gi, quad, rt):
++        import traceback
++        residual = None
++        verified = False
++        err = None
++        try:
++            pafs = [rt.paf(np.asarray(q, np.int8)[None, :])[0].astype(int)
++                    for q in quad]
++            residual = (rt.wt[0] * (pafs[0] + pafs[1])
++                        + rt.wt[1] * (pafs[2] + pafs[3])).tolist()
++            if not any(residual):
++                H = rt.assemble(quad)
++                N = core.verify_hadamard(H)
++                np.savetxt(os.path.abspath(f"hadamard_{N}_collision.csv"),
++                           H, fmt="%d", delimiter=",")
++                verified = True
++        except Exception:
++            err = traceback.format_exc()
++        rec = {"timestamp": time.time(), "worker_id": wid,
++               "route": rt.name, "seed": base_seed,
++               "cycle": telemetry.cycle + 1,
++               "pattern": [int(x) for x in pat], "bins": bins_s,
++               "indices": [int(x) for x in gi],
++               "sequences": ["".join("+" if v > 0 else "-" for v in q)
++                             for q in quad],
++               "paf_residual": residual,
++               "residual_zero": bool(residual is not None
++                                     and not any(residual)),
++               "verified_hadamard": verified,
++               "verify_exception": err}
++        try:
++            with open(coll_path, "a") as fh:
++                fh.write(json.dumps(rec) + "\n")
++        except OSError:
++            pass
++        out(f"COLLISION EVIDENCE saved: bins {bins_s} idx {gi} "
++            f"residual_zero={rec['residual_zero']} verified={verified}")
++
+     my_stop = os.path.join(mydir, "STOP_WORKER")
+ 
+     def should_stop():
+@@ -691,7 +745,7 @@
+             route, pools, state, max_pairs, chunk, stats, caches=caches,
+             heartbeat=lambda phase, extra=None: telemetry.heartbeat(
+                 pools, phase, extra, min_interval=heartbeat_seconds),
+-            should_stop=should_stop)
++            should_stop=should_stop, collision_sink=record_collision)
+         save_caches(mydir, route, pools, caches)
+         if found is not None:
+             pat, quad = found

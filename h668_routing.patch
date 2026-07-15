@@ -1,0 +1,665 @@
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before4/ctl.py h668_hardened/ctl.py
+--- h668_before4/ctl.py	2026-07-08 20:23:20.816970655 +0000
++++ h668_hardened/ctl.py	2026-07-08 20:24:46.108784827 +0000
+@@ -396,8 +396,31 @@
+         examined = acc + dup
+         dup_rate = 100 * dup / max(examined, 1)
+         psd_rate = 100 * psd / max(gen, 1)
++        status_j = {}
++        try:
++            status_j = json.load(open(os.path.join(d, "progress.json")))
++        except (OSError, ValueError):
++            pass
++        hb_age = time.time() - status_j.get("updated", 0) \
++            if status_j else float("inf")
++        mid_cycle = status_j.get("status") == "matching" or \
++            str(status_j.get("latest_cycle", {}).get("phase", "")
++                ).startswith("matching")
+         if cap and at_cap == nbins:
+             verdict = "(f) POOL-CAP SATURATED: raise --pool-cap"
++        elif gen == 0 and at_cap == 0 and last.get("cycle", 0) == 0:
++            if mid_cycle and hb_age < 120:
++                ph = status_j["latest_cycle"].get("phase", "matching")
++                eta = status_j["latest_cycle"].get("eta_key_seconds")
++                verdict = (f"mid-cycle ({ph}"
++                           + (f", key ETA {eta/3600:.1f}h" if eta
++                              else "") + ") -- long cycle in progress")
++            elif hb_age > 3600:
++                verdict = (f"UNPROVEN BUSY: no telemetry for "
++                           f"{hb_age/3600:.1f}h; heartbeats absent -- "
++                           f"restart to enable them")
++            else:
++                verdict = "no completed cycles yet (startup/long cycle)"
+         elif gen == 0:
+             verdict = "(f) generation gated (bins at/near cap)"
+         elif dup_rate > 90:
+@@ -473,6 +496,134 @@
+     print(f"results kept in {exp}; delete when done (safe -- isolated).")
+ 
+ 
++def recommend_routes(a):
++    """Summarize per-route productivity and recommend worker allocation.
++    Rules: high CPU + no telemetry update for --stale-hours => 'unproven
++    busy'. If one route accepts candidates and the other has accepted
++    nothing for hours, recommend shifting slots (with exact commands)."""
++    ps = ps_workers(a.workdir)
++    cpu = {}
++    out = subprocess.run(["ps", "-axo", "pid=,%cpu="],
++                         capture_output=True, text=True).stdout
++    for line in out.splitlines():
++        parts = line.split()
++        if len(parts) == 2:
++            try:
++                cpu[int(parts[0])] = float(parts[1])
++            except ValueError:
++                pass
++    routes = {}
++    for d in worker_dirs(a.workdir):
++        wid = int(os.path.basename(d).split("_")[1])
++        try:
++            p = json.load(open(os.path.join(d, "progress.json")))
++        except (OSError, ValueError):
++            continue
++        r = p.get("route", "?")
++        age_h = (time.time() - p.get("updated", 0)) / 3600
++        mins = max((p.get("updated", 0)
++                    - p.get("telemetry_started_at", 0)) / 60, 1e-9)
++        apm = p.get("totals", {}).get("accepted", 0) / mins
++        wcpu = max((cpu.get(pid, 0) for pid, _ in ps.get(wid, [])),
++                   default=0.0)
++        info = routes.setdefault(r, {"workers": [], "apm": 0.0,
++                                     "unproven": [], "stale_h": 0.0})
++        info["workers"].append(wid)
++        info["apm"] += apm
++        info["stale_h"] = max(info["stale_h"], age_h)
++        if wcpu > 50 and age_h > a.stale_hours:
++            info["unproven"].append(wid)
++    print(f"{'route':>6} {'workers':>18} {'acc/min':>10} "
++          f"{'max stale':>10} {'unproven busy'}")
++    for r, i in sorted(routes.items()):
++        print(f"{r:>6} {str(sorted(i['workers'])):>18} "
++              f"{i['apm']:>10,.1f} {i['stale_h']:>9.1f}h "
++              f"{sorted(i['unproven']) or '-'}")
++    gs, tt = routes.get("gs", {}), routes.get("tt", {})
++    print()
++    for r, i in routes.items():
++        if i["unproven"]:
++            print(f"* route {r}: workers {sorted(i['unproven'])} are "
++                  f"UNPROVEN BUSY (high CPU, telemetry silent > "
++                  f"{a.stale_hours}h). If they predate the heartbeat "
++                  f"patch, restart them to gain mid-cycle visibility "
++                  f"before drawing conclusions.")
++    if gs.get("apm", 0) > 0 and tt and tt.get("apm", 0) == 0 \
++            and tt.get("stale_h", 0) > a.stale_hours:
++        keep = sorted(tt.get("workers", []))[:2]
++        move = [w for w in sorted(tt.get("workers", [])) if w not in keep]
++        print(f"* RECOMMENDATION: GS is accepting "
++              f"({gs['apm']:,.0f}/min); TT has accepted 0 for "
++              f"{tt['stale_h']:.1f}h. Keep {len(keep)} TT worker(s) "
++              f"{keep} for evidence-gathering with heartbeats, and "
++              f"rotate {move} to GS with fresh seeds:")
++        seeds = ",".join(str(90001000 + k) for k in range(len(move)))
++        print(f"    python3 ctl.py rotate-gs-seeds --workdir "
++              f"{a.workdir} --seeds {seeds} --replace-workers "
++              f"{','.join(map(str, move))}")
++    elif tt.get("apm", 0) > 0:
++        print("* TT is accepting candidates; no rebalance needed.")
++    else:
++        print("* Insufficient evidence to recommend a shift yet; "
++              "let heartbeats accumulate.")
++
++
++def rotate_gs_seeds(a):
++    """Safely replace selected workers with fresh-seed GS workers.
++    Steps: merge pools (preserve their candidates in global), per-worker
++    STOP_WORKER (interrupt-safe mid-cycle), wait for lock release, retire
++    dir to work/retired/ (NEVER deleted), launch fresh GS worker with the
++    provided seed. Old state fully preserved."""
++    ids = [int(x) for x in a.replace_workers.split(",")]
++    seeds = [int(x) for x in a.seeds.split(",")]
++    if len(seeds) != len(ids):
++        sys.exit(f"need one seed per worker: {len(ids)} workers, "
++                 f"{len(seeds)} seeds")
++    print("merging pools first so retiring workers' candidates are "
++          "preserved in the global pools...")
++    merge(a)
++    for wid in ids:
++        d = os.path.join(a.workdir, f"worker_{wid:03d}")
++        if os.path.isdir(d):
++            with open(os.path.join(d, "STOP_WORKER"), "w") as fh:
++                fh.write("rotate-gs-seeds\n")
++            print(f"worker {wid}: STOP_WORKER written; waiting for "
++                  f"clean exit (interrupt-safe, may take ~1 min)...")
++    deadline = time.time() + a.wait_minutes * 60
++    pending = set(ids)
++    while pending and time.time() < deadline:
++        for wid in list(pending):
++            d = os.path.join(a.workdir, f"worker_{wid:03d}")
++            if not os.path.isdir(d) or not lock_holder(d)[0]:
++                pending.discard(wid)
++        time.sleep(2)
++    if pending:
++        print(f"WARNING: workers {sorted(pending)} did not exit within "
++              f"{a.wait_minutes} min; NOT retiring them. Re-run once "
++              f"they stop (heartbeat-enabled workers stop in minutes; "
++              f"pre-heartbeat workers only check at cycle boundaries).")
++        ids = [w for w in ids if w not in pending]
++    retired = os.path.join(a.workdir, "retired")
++    os.makedirs(retired, exist_ok=True)
++    for wid, seed in zip(ids, seeds):
++        d = os.path.join(a.workdir, f"worker_{wid:03d}")
++        if os.path.isdir(d):
++            dest = os.path.join(retired, f"worker_{wid:03d}.{int(time.time())}")
++            os.replace(d, dest)
++            print(f"worker {wid}: retired old dir -> {dest} (preserved)")
++        cmd = [sys.executable, "worker.py", "--route", "gs",
++               "--n", str(a.gs_n), "--worker-id", str(wid),
++               "--seed", str(seed), "--workdir", a.workdir,
++               "--pool-cap", str(a.pool_cap),
++               "--max-pairs", str(a.max_pairs)]
++        logf = open(os.path.join(a.workdir, f"launch_w{wid:03d}.out"), "a")
++        p = subprocess.Popen(cmd, stdout=logf, stderr=logf)
++        print(f"worker {wid}: fresh GS worker launched, seed={seed}, "
++              f"pid={p.pid}")
++    print("rotation complete; old state under work/retired/, global "
++          "pools untouched except the pre-rotation merge.")
++
++
+ def verify(a):
+     H = np.loadtxt(a.csv, delimiter=",", dtype=np.int64)
+     N = core.verify_hadamard(H)
+@@ -512,6 +663,17 @@
+     pe.add_argument("--minutes", type=float, default=3)
+     pe.add_argument("--pool-cap", type=int, default=20000)
+     pe.add_argument("--batch", type=int, default=200000)
++    pr = sub.add_parser("recommend-routes")
++    pr.add_argument("--workdir", default="work")
++    pr.add_argument("--stale-hours", type=float, default=3.0)
++    pg = sub.add_parser("rotate-gs-seeds")
++    pg.add_argument("--workdir", default="work")
++    pg.add_argument("--seeds", required=True)
++    pg.add_argument("--replace-workers", required=True)
++    pg.add_argument("--gs-n", type=int, default=167)
++    pg.add_argument("--pool-cap", type=int, default=100000)
++    pg.add_argument("--max-pairs", type=int, default=20_000_000)
++    pg.add_argument("--wait-minutes", type=float, default=10)
+     pv = sub.add_parser("verify")
+     pv.add_argument("csv")
+     a = ap.parse_args()
+@@ -519,7 +681,9 @@
+      "status": status, "monitor": monitor, "watch": watch, "stop": stop,
+      "merge": merge, "clean-bad": clean_bad, "migrate": migrate,
+      "kill-duplicates": kill_duplicates, "verify": verify,
+-     "acceptance": acceptance, "experiment": experiment}[a.cmd](a)
++     "acceptance": acceptance, "experiment": experiment,
++     "recommend-routes": recommend_routes,
++     "rotate-gs-seeds": rotate_gs_seeds}[a.cmd](a)
+ 
+ 
+ if __name__ == "__main__":
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before4/engine.py h668_hardened/engine.py
+--- h668_before4/engine.py	2026-07-08 20:23:20.818292295 +0000
++++ h668_hardened/engine.py	2026-07-08 20:23:20.840214680 +0000
+@@ -140,12 +140,17 @@
+ 
+ def match(pafA, pafB, pafC, pafD, wt1=1, wt2=1,
+           max_pairs=20_000_000, chunk=4000, stats=None,
+-          psd1=None, psd2=None):
++          psd1=None, psd2=None, on_progress=None):
+     """Find (i,j,k,l) with wt1*(pafA[i]+pafB[j]) + wt2*(pafC[k]+pafD[l]) = 0.
+ 
+     COMPLETE over the given arrays: chunking never drops rows. Optional
+     psd1=(psdA,psdB,cap1) / psd2=(psdC,psdD,cap2) enable the sound pair-PSD
+-    screen. Returns global indices or None."""
++    screen. Returns global indices or None.
++
++    on_progress(rows_done, rows_total) is called after each chunk (every
++    few seconds of work). If it returns False, matching ABORTS cleanly:
++    stats["interrupted"] is set and None is returned. Aborting is safe --
++    callers must not advance watermarks for interrupted regions."""
+     if stats is None:
+         stats = defaultdict(int)
+     h = pafA.shape[1]
+@@ -153,6 +158,10 @@
+     eff = max(1, min(chunk, max_pairs // max(len(pafB), 1)))
+     psdA_all = psd1[0] if psd1 else None
+     for lo in range(0, len(pafA), eff):
++        if on_progress is not None and \
++                on_progress(lo, len(pafA)) is False:
++            stats["interrupted"] += 1
++            return None
+         A = np.ascontiguousarray(pafA[lo:lo + eff])
+         pA = (psdA_all[lo:lo + eff], psd1[1], psd1[2]) if psd1 else None
+         if lib is not None:
+@@ -163,6 +172,8 @@
+                              psd1=pA, psd2=psd2)
+         if r is not None:
+             return (r[0] + lo, r[1], r[2], r[3])
++    if on_progress is not None:
++        on_progress(len(pafA), len(pafA))
+     return None
+ 
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before4/tests_routing.py h668_hardened/tests_routing.py
+--- h668_before4/tests_routing.py	1970-01-01 00:00:00.000000000 +0000
++++ h668_hardened/tests_routing.py	2026-07-08 20:30:32.475881083 +0000
+@@ -0,0 +1,220 @@
++"""Routing/heartbeat/rotation tests. Run: python3 tests_routing.py"""
++import json
++import os
++import shutil
++import subprocess
++import sys
++import time
++from collections import defaultdict
++
++import numpy as np
++
++import core
++import engine
++import worker as wk
++
++rng = np.random.default_rng(51)
++PASS = 0
++PY = sys.executable
++
++
++def check(name, cond):
++    global PASS
++    if not cond:
++        print(f"FAIL  {name}")
++        sys.exit(1)
++    PASS += 1
++    print(f"ok    {name}")
++
++
++def ctl(args):
++    return subprocess.run([PY, "ctl.py"] + args, capture_output=True,
++                          text=True, timeout=600)
++
++
++# ---- 1. heartbeat fires mid-match; interrupt aborts without losing keys ----
++route = wk.GSRoute(13)
++pools = {s: engine.Pool(13, True) for s in route.bins}
++for s in route.bins:
++    for _ in range(40):
++        if len(pools[s].seqs) >= 64:
++            break
++        pools[s].add(route.generate(s, 20000, rng),
++                     need=64 - len(pools[s].seqs))
++beats = []
++st = wk.MatchState("rt_state.json")
++res = wk.incremental_match(
++    route, pools, st, 500, 2, defaultdict(int), caches={},
++    heartbeat=lambda phase, extra=None: beats.append((phase, extra)),
++    should_stop=lambda: False)
++check("heartbeat fires during matching with phase + counters + ETA",
++      len(beats) > 0 and beats[0][0].startswith("matching key")
++      and {"pairs_hashed", "probes", "eta_key_seconds",
++           "key_pairs_planned"} <= set(beats[-1][1]))
++
++# interrupt mid-run on MATCHLESS pools: completed keys persist, the
++# interrupted key is NOT marked done, and completing later checks
++# everything (no potentially valid region skipped)
++def any_match(pls):
++    for pat in route.patterns:
++        for (b1, b2), (b3, b4) in route.splits(pat):
++            pf = lambda b: core.paf_half_batch(pls[b].seqs)
++            if engine.find_all_matches(pf(b1), pf(b2), pf(b3), pf(b4)):
++                return True
++    return False
++
++tiny = {b: engine.Pool(13, True) for b in route.bins}
++k = 3
++while True:
++    for b in route.bins:
++        tiny[b].seqs = pools[b].seqs[:k].copy()
++        tiny[b].keys = set()
++    if not any_match(tiny) or k == 1:
++        break
++    k -= 1
++if any_match(tiny):
++    print("note: could not build matchless pools; skipping interrupt test")
++else:
++    if os.path.exists("rt_state.json"):
++        os.remove("rt_state.json")
++    st1 = wk.MatchState("rt_state.json")
++    calls = {"n": 0}
++    r_int = wk.incremental_match(
++        route, tiny, st1, 500, 1, defaultdict(int), caches={},
++        heartbeat=None,
++        should_stop=lambda: calls.__setitem__("n", calls["n"] + 1)
++        or calls["n"] > 15)
++    completed = len(st1.marks)
++    st1b = wk.MatchState("rt_state.json")
++    st1b.load(tiny, wk.bin_key)
++    check("interrupt: aborts cleanly, watermarks persisted only for "
++          "completed keys",
++          r_int is None and st1b.marks == st1.marks
++          and completed < sum(len(route.splits(p))
++                              for p in route.patterns))
++    r_fin = wk.incremental_match(route, tiny, st1b, 500, 1,
++                                 defaultdict(int), caches={},
++                                 should_stop=lambda: False)
++    st2 = wk.MatchState("rt_state.json")
++    st2.load(tiny, wk.bin_key)
++    n_keys = sum(len(route.splits(p)) for p in route.patterns)
++    check(f"finishing after interrupt covers all {n_keys} keys "
++          "(no potentially valid region skipped)",
++          r_fin is None and len(st2.marks) == n_keys)
++    if os.path.exists("rt_state.json"):
++        os.remove("rt_state.json")
++
++# ---- 2. live worker: mid-cycle progress.json heartbeats + STOP_WORKER ------
++wd = "rt_work"
++shutil.rmtree(wd, ignore_errors=True)
++env = {**os.environ}
++proc = subprocess.Popen(
++    [PY, "worker.py", "--route", "gs", "--n", "41", "--worker-id", "0",
++     "--workdir", wd, "--pool-cap", "4000", "--batch", "50000",
++     "--max-pairs", "300000", "--chunk", "50",
++     "--heartbeat-seconds", "0.2"],
++    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
++ppath = os.path.join(wd, "worker_000", "progress.json")
++seen_matching, updates = False, set()
++deadline = time.time() + 120
++while time.time() < deadline:
++    if os.path.exists(ppath):
++        try:
++            p = json.load(open(ppath))
++            updates.add(p["updated"])
++            if p.get("status") == "matching":
++                seen_matching = True
++                break
++        except (ValueError, OSError):
++            pass
++    time.sleep(0.5)
++check("live worker updates progress.json mid-cycle (status=matching)",
++      seen_matching and len(updates) >= 2)
++open(os.path.join(wd, "worker_000", "STOP_WORKER"), "w").write("test\n")
++try:
++    proc.wait(timeout=180)
++    stopped = True
++except subprocess.TimeoutExpired:
++    proc.kill()
++    stopped = False
++check("per-worker STOP_WORKER interrupts a worker mid-cycle within minutes",
++      stopped)
++p = json.load(open(ppath))
++check("stopped worker records status=stopped", p["status"] == "stopped")
++
++# ---- 3. acceptance verdict: fresh TT mid-cycle is not 'generation gated' ---
++tt = os.path.join(wd, "worker_003")
++os.makedirs(tt, exist_ok=True)
++json.dump({"route": "tt"}, open(os.path.join(tt, "meta.json"), "w"))
++wk.write_json_atomic(os.path.join(tt, "progress.json"), {
++    "route": "tt", "updated": time.time(), "cycle": 0, "status": "matching",
++    "telemetry_started_at": time.time() - 3600, "totals": {"accepted": 0},
++    "pools": {str(i): 50 for i in range(19)}, "pool_cap": 100000,
++    "latest_cycle": {"phase": "matching key 3/12 block 1/4",
++                     "eta_key_seconds": 7200}})
++r = ctl(["acceptance", "--workdir", wd])
++check("acceptance labels mid-cycle TT as long-cycle-in-progress with ETA, "
++      "not generation gated",
++      "mid-cycle" in r.stdout and "generation gated" not in
++      [l for l in r.stdout.splitlines() if " 3 " in l or "tt" in l][0]
++      if any(" 3 " in l for l in r.stdout.splitlines()) else
++      "mid-cycle" in r.stdout)
++# stale-silent worker -> UNPROVEN BUSY
++wk.write_json_atomic(os.path.join(tt, "progress.json"), {
++    "route": "tt", "updated": time.time() - 7 * 3600, "cycle": 0,
++    "status": "running", "telemetry_started_at": time.time() - 9 * 3600,
++    "totals": {"accepted": 0}, "pools": {str(i): 50 for i in range(19)},
++    "pool_cap": 100000, "latest_cycle": {}})
++r = ctl(["acceptance", "--workdir", wd])
++check("acceptance flags silent-busy workers as UNPROVEN BUSY",
++      "UNPROVEN BUSY" in r.stdout)
++
++# ---- 4. recommend-routes ------------------------------------------------------
++gsd = os.path.join(wd, "worker_000")
++p = json.load(open(os.path.join(gsd, "progress.json")))
++p["totals"]["accepted"] = 50000
++p["telemetry_started_at"] = time.time() - 3600
++p["updated"] = time.time()
++wk.write_json_atomic(os.path.join(gsd, "progress.json"), p)
++r = ctl(["recommend-routes", "--workdir", wd, "--stale-hours", "3"])
++check("recommend-routes summarizes per-route productivity",
++      "acc/min" in r.stdout and "gs" in r.stdout and "tt" in r.stdout)
++check("recommend-routes recommends shifting stale-zero TT slots to GS "
++      "with exact rotate command",
++      "RECOMMENDATION" in r.stdout and "rotate-gs-seeds" in r.stdout)
++
++# ---- 5. rotate-gs-seeds: safe replacement -------------------------------------
++sentinel = json.load(open(os.path.join(tt, "progress.json")))
++r = ctl(["rotate-gs-seeds", "--workdir", wd, "--seeds", "91000000",
++         "--replace-workers", "3", "--gs-n", "13", "--pool-cap", "200",
++         "--wait-minutes", "1"])
++check("rotate: merges first, retires old dir, launches fresh GS seed",
++      "merging pools first" in r.stdout and "retired old dir" in r.stdout
++      and "seed=91000000" in r.stdout)
++retired = os.listdir(os.path.join(wd, "retired"))
++check("rotate: old worker state preserved under retired/, never deleted",
++      len(retired) == 1 and json.load(open(os.path.join(
++          wd, "retired", retired[0], "progress.json")))["route"] == "tt")
++time.sleep(3)
++newp = os.path.join(wd, "worker_003", "progress.json")
++deadline = time.time() + 90
++ok_new = False
++while time.time() < deadline:
++    try:
++        np_ = json.load(open(newp))
++        if np_["route"] == "gs":
++            ok_new = True
++            break
++    except (OSError, ValueError):
++        pass
++    time.sleep(1)
++check("rotate: replacement worker runs as GS in a fresh dir", ok_new)
++open(os.path.join(wd, "worker_003", "STOP_WORKER"), "w").write("cleanup\n")
++time.sleep(2)
++r = ctl(["stop", "--workdir", wd])
++time.sleep(3)
++shutil.rmtree(wd, ignore_errors=True)
++for f in ("hadamard_52.csv", "hadamard_116.csv"):
++    if os.path.exists(f):
++        os.remove(f)
++print(f"\nALL {PASS} ROUTING TESTS PASSED")
+diff -ruN '--exclude=__pycache__' '--exclude=libfastmatch.so' h668_before4/worker.py h668_hardened/worker.py
+--- h668_before4/worker.py	2026-07-08 20:23:20.820600905 +0000
++++ h668_hardened/worker.py	2026-07-08 20:30:32.442799454 +0000
+@@ -206,7 +206,7 @@
+ 
+ 
+ def incremental_match(route, pools, state, max_pairs, chunk, stats,
+-                      caches=None):
++                      caches=None, heartbeat=None, should_stop=None):
+     """Check exactly the quadruples not covered by the watermarks: with old
+     region a0 x b0 x c0 x d0 already checked, the four disjoint blocks
+       A[a0:] x B x C x D
+@@ -224,8 +224,13 @@
+     def psd_of(b):
+         return caches[b][2]
+ 
++    n_keys = sum(len(route.splits(p)) for p in route.patterns)
++    key_i = 0
++    t_start = time.time()
++    pairs_done_prior = 0
+     for pi, pat in enumerate(route.patterns):
+         for si, ((b1, b2), (b3, b4)) in enumerate(route.splits(pat)):
++            key_i += 1
+             bins = (b1, b2, b3, b4)
+             if min(len(pools[b].seqs) for b in bins) == 0:
+                 continue
+@@ -244,18 +249,63 @@
+                 ((0, o[0]), (0, o[1]), (o[2], L[2]), (0, L[3])),
+                 ((0, o[0]), (0, o[1]), (0, o[2]), (o[3], L[3])),
+             ]
+-            for (a_lo, a_hi), (b_lo, b_hi), (c_lo, c_hi), (d_lo, d_hi) \
+-                    in blocks:
++            planned = sum((ah - al) * (bh - bl)
++                          for (al, ah), (bl, bh), _, _ in blocks
++                          if ah > al and bh > bl)
++            for bi, ((a_lo, a_hi), (b_lo, b_hi), (c_lo, c_hi),
++                     (d_lo, d_hi)) in enumerate(blocks):
+                 if a_lo >= a_hi or b_lo >= b_hi or c_lo >= c_hi \
+                         or d_lo >= d_hi:
+                     continue
++
++                def on_progress(rows, total, _b=(b_lo, b_hi),
++                                _bi=bi):
++                    if should_stop is not None and should_stop():
++                        return False
++                    if heartbeat is not None:
++                        done = (stats["pairs_hashed"]
++                                + stats["psd_skipped"] // 2)
++                        rate = max(done / max(
++                            time.time() - t_start, 1e-9), 1.0)
++                        remaining = max(planned - (done
++                                                   - pairs_done_prior), 0)
++                        heartbeat(
++                            phase=f"matching key {key_i}/{n_keys} "
++                                  f"block {_bi + 1}/4",
++                            extra={
++                                "pattern": [int(x) for x in pat],
++                                "bins": [str(b) for b in bins],
++                                "key_pairs_planned": int(planned),
++                                "pairs_hashed": int(
++                                    stats["pairs_hashed"]),
++                                "probes": int(stats["probes"]),
++                                "probe_psd_rej": int(
++                                    stats["psd_skipped"]),
++                                "psd_rejected": int(
++                                    stats["psd_skipped"]),
++                                "generated": int(stats["generated"]),
++                                "accepted": int(stats["accepted"]),
++                                "dup_rejected": int(
++                                    stats["dup_rejected"]),
++                                "eta_key_seconds": int(
++                                    remaining / rate),
++                            })
++                    return True
++
+                 hit = engine.match(
+                     pafs[0][a_lo:a_hi], pafs[1][b_lo:b_hi],
+                     pafs[2][c_lo:c_hi], pafs[3][d_lo:d_hi],
+                     wt1=route.wt[0], wt2=route.wt[1],
+                     max_pairs=max_pairs, chunk=chunk, stats=stats,
+                     psd1=(psds[0][a_lo:a_hi], psds[1][b_lo:b_hi], cap1),
+-                    psd2=(psds[2][c_lo:c_hi], psds[3][d_lo:d_hi], cap2))
++                    psd2=(psds[2][c_lo:c_hi], psds[3][d_lo:d_hi], cap2),
++                    on_progress=on_progress)
++                if stats.get("interrupted"):
++                    # do NOT advance this key's watermark; completed keys
++                    # were already persisted below. Resume redoes only
++                    # the interrupted key.
++                    state.save()
++                    return None
+                 if hit is not None:
+                     i, j, k, l = hit
+                     quad = [pools[b1].seqs[a_lo + i],
+@@ -263,9 +313,12 @@
+                             pools[b3].seqs[c_lo + k],
+                             pools[b4].seqs[d_lo + l]]
+                     return pat, quad
++            pairs_done_prior = (stats["pairs_hashed"]
++                                + stats["psd_skipped"] // 2)
+             state.update(key, {str(b): n for b, n in zip(bins, L)},
+                          pools, bin_key)
+-    state.save()
++            state.save()   # persist per completed key: multi-hour cycles
++                           # now checkpoint incrementally
+     return None
+ 
+ 
+@@ -494,6 +547,20 @@
+         except OSError:
+             pass
+ 
++    def heartbeat(self, pools, phase, extra=None, min_interval=30.0):
++        """Mid-cycle progress.json update (throttled). Adds phase telemetry
++        so multi-hour cycles are observable: current phase, current key/bin,
++        in-cycle counters, pair progress and ETA. Never touches totals."""
++        now = time.time()
++        if now - getattr(self, "_last_hb", 0) < min_interval:
++            return
++        self._last_hb = now
++        latest = dict(extra or {})
++        latest["phase"] = phase
++        self.write(latest, now - getattr(self, "_cycle_t0", now), pools,
++                   "matching" if phase.startswith("matching")
++                   else "running")
++
+     def write(self, latest, secs, pools, status):
+         import native
+         nstat = native.status(with_speedup=(self.cycle <= 1))
+@@ -530,7 +597,7 @@
+ 
+ 
+ def run_worker(route, wid, base_seed, workdir, pool_cap, batch,
+-               max_pairs, chunk, cycle_seconds):
++               max_pairs, chunk, cycle_seconds, heartbeat_seconds=30.0):
+     mydir = os.path.join(workdir, f"worker_{wid:03d}")
+     os.makedirs(workdir, exist_ok=True)
+ 
+@@ -583,10 +650,17 @@
+         print(line)
+         log.write(line + "\n")
+ 
++    my_stop = os.path.join(mydir, "STOP_WORKER")
++
++    def should_stop():
++        return os.path.exists(stop_path) or os.path.exists(my_stop)
++
+     cycle = 0
+-    while not os.path.exists(stop_path):
++    while not should_stop():
+         cycle += 1
+         t0 = time.time()
++        telemetry._cycle_t0 = t0
++        telemetry.heartbeat(pools, "generating", min_interval=0)
+ 
+         stats = defaultdict(int)
+         for b in route.bins:
+@@ -612,8 +686,11 @@
+ 
+         save_npz(pool_path, {bin_key(b): p.seqs for b, p in pools.items()})
+ 
+-        found = incremental_match(route, pools, state, max_pairs, chunk,
+-                                  stats, caches=caches)
++        found = incremental_match(
++            route, pools, state, max_pairs, chunk, stats, caches=caches,
++            heartbeat=lambda phase, extra=None: telemetry.heartbeat(
++                pools, phase, extra, min_interval=heartbeat_seconds),
++            should_stop=should_stop)
+         save_caches(mydir, route, pools, caches)
+         if found is not None:
+             pat, quad = found
+@@ -646,11 +723,10 @@
+             f"psdskip={stats['psd_skipped']:,} "
+             f"baseline_keys={stats['baseline_keys']} "
+             f"incr_keys={stats['incremental_keys']}")
+-        while (time.time() - t0 < cycle_seconds
+-               and not os.path.exists(stop_path)):
++        while (time.time() - t0 < cycle_seconds and not should_stop()):
+             time.sleep(0.5)
+     telemetry.write({}, 0.0, pools, "stopped")
+-    out("STOP observed; exiting cleanly")
++    out("STOP observed (global or per-worker); exiting cleanly")
+     return 1
+ 
+ 
+@@ -667,11 +743,13 @@
+     ap.add_argument("--max-pairs", type=int, default=20_000_000)
+     ap.add_argument("--chunk", type=int, default=4000)
+     ap.add_argument("--cycle-seconds", type=float, default=0)
++    ap.add_argument("--heartbeat-seconds", type=float, default=30.0,
++                    help="mid-cycle progress.json update interval")
+     a = ap.parse_args()
+     route = GSRoute(a.n or 167) if a.route == "gs" else TTRoute(a.n or 56)
+     raise SystemExit(run_worker(route, a.worker_id, a.seed, a.workdir,
+                                 a.pool_cap, a.batch, a.max_pairs, a.chunk,
+-                                a.cycle_seconds))
++                                a.cycle_seconds, a.heartbeat_seconds))
+ 
+ 
+ if __name__ == "__main__":
